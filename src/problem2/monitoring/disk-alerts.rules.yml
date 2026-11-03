@@ -1,0 +1,219 @@
+# Disk alerts for NGINX edge VMs (node_exporter metrics).
+# Validate: promtool check rules disk-alerts.rules.yml && promtool test rules disk-alerts.test.yml
+#
+# Design:
+#  - avail_bytes, not free_bytes: avail is what NGINX workers (www-data) can
+#    use; the ext4 root reserve is invisible to them.
+#  - Page only when NGINX will hit ENOSPC within hours or is about to; slower
+#    trends open a ticket.
+#  - Trend alerts cannot see a plateau: a disk sitting flat at 99% has zero
+#    slope. The floor alert is the one deliberate static threshold, set where
+#    action is mandatory rather than at an arbitrary 80/90%.
+#  - Every space/inode rule ignores read-only mounts; FilesystemReadOnly covers
+#    those. Assumes a separate up == 0 / TargetDown alert.
+#  - Adjust the job matcher to your scrape config.
+groups:
+  - name: node-filesystem-space
+    rules:
+      # Emergency path with no percentage gate: a flood at any fill level pages
+      # while there is still time to act (the gated rules can only fire late).
+      - alert: FilesystemExhaustionImminent
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}
+              / -deriv(node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}[10m])
+          ) < 1800
+          and
+          deriv(node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}[10m]) < 0
+          and
+          node_filesystem_readonly{job="node", fstype=~"ext4|xfs"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} runs out of space in about {{ $value | humanizeDuration }}"
+          description: "At the 10m trend this filesystem is full within 30 minutes. Mitigate first (runbook step 2), diagnose second."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+      # Fast burn: log floods, buffered-download spikes. Short window, short
+      # horizon, short hold, so it pages before ENOSPC rather than after.
+      - alert: FilesystemWillFillIn1h
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}
+              / node_filesystem_size_bytes{job="node", fstype=~"ext4|xfs"}
+          ) < 0.10
+          and
+          predict_linear(node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}[30m], 3600) < 0
+          and
+          node_filesystem_readonly{job="node", fstype=~"ext4|xfs"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} will run out of space within 1h"
+          description: "{{ $value | humanizePercentage }} available and falling fast (30m trend). NGINX workers get ENOSPC at 0."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+      - alert: FilesystemWillFillIn4h
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}
+              / node_filesystem_size_bytes{job="node", fstype=~"ext4|xfs"}
+          ) < 0.20
+          and
+          predict_linear(node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}[1h], 4 * 3600) < 0
+          and
+          node_filesystem_readonly{job="node", fstype=~"ext4|xfs"} == 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} will run out of space within 4h"
+          description: "{{ $value | humanizePercentage }} available and falling at the 1h trend. NGINX workers get ENOSPC at 0."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+      - alert: FilesystemWillFillIn24h
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}
+              / node_filesystem_size_bytes{job="node", fstype=~"ext4|xfs"}
+          ) < 0.40
+          and
+          predict_linear(node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}[6h], 24 * 3600) < 0
+          and
+          node_filesystem_readonly{job="node", fstype=~"ext4|xfs"} == 0
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} will run out of space within 24h"
+          description: "{{ $value | humanizePercentage }} available and falling at the 6h trend."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+      - alert: FilesystemAlmostFull
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node", fstype=~"ext4|xfs"}
+              / node_filesystem_size_bytes{job="node", fstype=~"ext4|xfs"}
+          ) < 0.05
+          and
+          node_filesystem_readonly{job="node", fstype=~"ext4|xfs"} == 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} has under 5% space available"
+          description: "{{ $value | humanizePercentage }} available. One log burst or a few large buffered responses away from ENOSPC."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+  - name: node-filesystem-inodes
+    rules:
+      # Same emergency path as bytes: millions of small cache objects can
+      # exhaust inodes faster than the gated rules can fire.
+      - alert: FilesystemInodesExhaustionImminent
+        expr: |
+          (
+            node_filesystem_files_free{job="node", fstype=~"ext4|xfs"}
+              / -deriv(node_filesystem_files_free{job="node", fstype=~"ext4|xfs"}[10m])
+          ) < 1800
+          and
+          deriv(node_filesystem_files_free{job="node", fstype=~"ext4|xfs"}[10m]) < 0
+          and
+          node_filesystem_readonly{job="node", fstype=~"ext4|xfs"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} runs out of inodes in about {{ $value | humanizeDuration }}"
+          description: "At the 10m trend inodes are exhausted within 30 minutes: ENOSPC despite free blocks."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+      - alert: FilesystemInodesWillFillIn4h
+        expr: |
+          (
+            node_filesystem_files_free{job="node", fstype=~"ext4|xfs"}
+              / node_filesystem_files{job="node", fstype=~"ext4|xfs"}
+          ) < 0.20
+          and
+          predict_linear(node_filesystem_files_free{job="node", fstype=~"ext4|xfs"}[1h], 4 * 3600) < 0
+          and
+          node_filesystem_readonly{job="node", fstype=~"ext4|xfs"} == 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} will run out of inodes within 4h"
+          description: "{{ $value | humanizePercentage }} of inodes free and falling. ENOSPC despite free blocks; usually millions of small cache objects."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+      - alert: FilesystemInodesAlmostFull
+        expr: |
+          (
+            node_filesystem_files_free{job="node", fstype=~"ext4|xfs"}
+              / node_filesystem_files{job="node", fstype=~"ext4|xfs"}
+          ) < 0.05
+          and
+          node_filesystem_readonly{job="node", fstype=~"ext4|xfs"} == 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} has under 5% of inodes free"
+          description: "{{ $value | humanizePercentage }} of inodes free."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+  - name: node-filesystem-health
+    rules:
+      # ext4 errors=remount-ro: writes fail while the space rules go quiet.
+      # Scoped to mounts that must be writable (extend for your layout), so an
+      # intentional read-only bind mount such as /mnt/rootfs does not page.
+      - alert: FilesystemReadOnly
+        expr: node_filesystem_readonly{job="node", fstype=~"ext4|xfs", mountpoint=~"/|/var|/var/log|/var/cache/nginx|/var/lib/nginx"} == 1
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} is mounted read-only"
+          description: "Usually an ext4 error remount. NGINX cannot log, buffer or cache; check dmesg before anything else."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+      - alert: FilesystemStatsMissing
+        expr: node_filesystem_device_error{job="node", fstype=~"ext4|xfs"} == 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} cannot stat {{ $labels.mountpoint }}"
+          description: "node_exporter's statfs failed: every space and inode alert for this mount is blind."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+  - name: node-filesystem-deleted-open
+    rules:
+      # From scripts/deleted-open-files.sh, which excludes NGINX's request
+      # buffers (EXCLUDE_RE). This is aggregate pressure, not a diagnosis.
+      - alert: DeletedFilesHoldingSpace
+        expr: filesystem_deleted_open_bytes{job="node"} > 1024 * 1024 * 1024
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} has {{ $value | humanize1024 }}B in deleted-but-open files"
+          description: "Space df counts and du cannot see. Identify the holder with lsof -a +L1 before acting (runbook steps 2-3)."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"
+
+      # Stale, missing (e.g. /run cleared by a reboot and the timer broken), or unparsable.
+      - alert: DeletedOpenCollectorBroken
+        expr: |
+          time() - node_textfile_mtime_seconds{job="node", file=~".*filesystem_deleted_open.prom"} > 900
+          or
+          (up{job="node"} == 1 unless on(instance) node_textfile_mtime_seconds{job="node", file=~".*filesystem_deleted_open.prom"})
+          or
+          node_textfile_scrape_error{job="node"} == 1
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} deleted-open-files metric is stale, missing or unreadable"
+          description: "Check the systemd timer, the textfile directory (on tmpfs) and node_textfile_scrape_error."
+          runbook_url: "https://runbooks.example.com/nginx-lb/disk-full"

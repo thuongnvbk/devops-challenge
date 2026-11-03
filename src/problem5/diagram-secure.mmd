@@ -1,0 +1,125 @@
+flowchart TB
+  subgraph CLIENTS["Clients"]
+    WEB["[~] Web and mobile apps<br/>passkeys, device-bound request signing"]
+    BOTS["API clients and market makers<br/>Ed25519-signed requests"]
+  end
+
+  subgraph EDGE["AWS edge, global: Shield Advanced on every entry point"]
+    R53["[~] Route 53<br/>registry lock, CAA"]
+    CF["[~] CloudFront + WAF<br/>rate rules, Bot Control on web paths, CSP and SRI<br/>origin group: Tokyo, then Singapore VPC origin"]
+    GA["[~] Global Accelerator<br/>client IP preserved"]
+  end
+
+  subgraph IDACC["Identity account: PII domain"]
+    ID["[+] identity<br/>passkeys, sessions, API key registry"]
+  end
+
+  subgraph PRIMARY["Primary region: Tokyo. No workload subnet routes to the internet"]
+    subgraph ING["Ingress subnets, private"]
+      ALBP["[~] alb-public, internal<br/>CloudFront VPC origin only"]
+      ALBT["[~] alb-trading, internal + WAF<br/>Global Accelerator only"]
+    end
+    subgraph APP["App subnets: EKS general node pool"]
+      OG["[~] order-gateway<br/>verify client signature, scope, IP<br/>sign every command"]
+      QA["[=] query-api"]
+      SGW["[=] stream-gateway"]
+      MD["[=] md-service"]
+      PROJ["[=] projectors"]
+      OPS["[+] ops-producer<br/>appends operator-signed commands"]
+    end
+    subgraph CORE["Core subnets: no exec, no SSM, no SSH"]
+      MC["[~] matching-core-0, 1, 2<br/>signature and class checks, two-person rule<br/>time bound, withdrawal states"]
+    end
+    subgraph DATA["Data subnets and regional services"]
+      MSK["[~] MSK, Kafka 3.8+: IAM auth only, TLS, CMK<br/>per-topic IAM permissions, core-0 for the core only<br/>adds auth.keys, core.custody"]
+      DDB["[~] DynamoDB<br/>lease: core writes only<br/>ops-proposals table"]
+      AUR["[~] Aurora: CMK, TLS<br/>insert-only ledger journal"]
+      VK["[~] Valkey: TLS, RBAC per service<br/>no credentials"]
+      S3["[~] S3: Object Lock, archive 7 years, snapshots 7 days<br/>trust comes from signed checkpoints"]
+    end
+  end
+
+  subgraph CUST["Custody domain, outside this design"]
+    WAL["[~] wallet service<br/>broadcasts only on verifier attestations"]
+    DEP["[+] deposit attester<br/>own account and chain nodes"]
+  end
+
+  subgraph SECACC["Security, log-archive and backup accounts"]
+    SM["[+] security-monitor, per region<br/>independent verifier replica<br/>signed checkpoints, withdrawal attestations"]
+    DET["[+] CloudTrail org trail, GuardDuty, Security Hub"]
+    FR["[+] fence-relay<br/>P1 fence SCP, two signatures"]
+    VAULT["[+] Log archive and backup vault<br/>Object Lock, vault lock"]
+  end
+
+  subgraph OPERATORS["Operators"]
+    OPR["[+] Identity Center with FIDO2<br/>per-person KMS signing keys, multi-Region"]
+  end
+
+  subgraph DRREGION["DR region: Singapore, same security modules"]
+    MSK2["[~] MSK, same IAM permissions<br/>Replicator trusted for delivery only"]
+    MCF["[~] matching-core follower<br/>verifies the same signatures"]
+    AUR2["[~] Aurora secondary, Singapore CMK"]
+    EKS2["[~] EKS services, same admission and policies<br/>DR alb-public and alb-trading, internal + WAF"]
+    S32["[~] S3 replica, Object Lock"]
+  end
+
+  subgraph LEGEND["Legend"]
+    LA["[+] ADDED"]
+    LC["[~] CHANGED"]
+    LK["[=] ACCEPTED AS IS<br/>baseline controls only"]
+  end
+
+  R53 -.->|"alias"| CF
+  R53 -.->|"alias"| GA
+  WEB --> CF
+  WEB --> GA
+  BOTS --> GA
+  CF -->|"login paths"| ID
+  CF -->|"VPC origin"| ALBP
+  GA --> ALBT
+  GA -.->|"failover endpoint group"| EKS2
+  CF -.->|"origin group failover"| EKS2
+  ALBP --> MD
+  ALBP --> SGW
+  ALBT --> OG
+  ALBT --> QA
+  ALBT --> SGW
+  ID -->|"signed key records"| MSK
+  OG -->|"1 signed command"| MSK
+  MSK -->|"2 verify, then apply"| MC
+  MC -->|"3 replies"| OG
+  MC -->|"4 transactional publish"| MSK
+  MC -.->|"lease"| DDB
+  MC -->|"snapshots"| S3
+  OG --> VK
+  MSK --> MD
+  MD --> MSK
+  MSK --> SGW
+  MSK --> PROJ
+  PROJ --> AUR
+  PROJ --> VK
+  QA --> VK
+  QA --> AUR
+  WAL -->|"custody commands"| MSK
+  DEP -->|"deposit attestations"| MSK
+  MSK -->|"core.custody"| WAL
+  OPR -->|"propose and co-sign"| DDB
+  DDB --> OPS
+  OPS -->|"operator commands"| MSK
+  OPR -->|"two signatures"| FR
+  MSK --> SM
+  SM -->|"checkpoints, authorizations"| MSK
+  SM -->|"signed attestations"| WAL
+  MSK ==>|"MSK Replicator, async"| MSK2
+  MSK2 --> MCF
+  AUR ==>|"Global Database, async"| AUR2
+  S3 ==>|"Cross-Region Replication"| S32
+  AUR -.->|"backup copies"| VAULT
+  DET -.-> VAULT
+
+  classDef added fill:#dafbe1,stroke:#1a7f37,stroke-width:2px,color:#000
+  classDef changed fill:#fff8c5,stroke:#9a6700,stroke-width:2px,color:#000
+  classDef accepted fill:#f6f8fa,stroke:#8c959f,stroke-dasharray: 4 3,color:#000
+  class ID,SM,OPS,DET,FR,VAULT,OPR,DEP,LA added
+  class WEB,R53,CF,GA,ALBP,ALBT,OG,MC,MSK,DDB,AUR,VK,S3,WAL,MSK2,MCF,AUR2,EKS2,S32,LC changed
+  class QA,SGW,MD,PROJ,LK accepted

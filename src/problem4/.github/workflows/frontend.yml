@@ -58,10 +58,11 @@ jobs:
       - name: Unit tests
         run: npm test
 
-      # Gate on what ships to browsers. Build-only tooling is kept current by
-      # Dependabot rather than blocking releases on dev-server advisories.
+      # Every dependency is a devDependency: the bundle has no runtime deps,
+      # and Vite/Rolldown/TypeScript produce the bytes that ship. So audit the
+      # whole tree; `--omit=dev` would audit nothing.
       - name: Vulnerability scan
-        run: npm audit --omit=dev --audit-level=high
+        run: npm audit --audit-level=high
 
       - name: Build
         env:

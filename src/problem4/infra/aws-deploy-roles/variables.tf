@@ -13,21 +13,18 @@ variable "github_repository" {
   }
 }
 
-# Repositories created (or renamed/transferred) after 2026-07-15 put numeric
-# IDs in the OIDC subject: repo:OWNER@OWNER_ID/REPO@REPO_ID:... . IDs cannot
-# be re-registered, so they also stop a deleted-and-recreated repository name
-# from inheriting these roles. Get them with:
+# The OIDC subject is customised (../github-environments) to carry numeric
+# IDs, which can never be re-registered, so a deleted-and-recreated repository
+# name cannot inherit these roles. Get them with:
 #   gh api repos/OWNER/REPO --jq '.owner.id, .id'
 variable "github_owner_id" {
-  description = "Numeric owner ID for the immutable OIDC subject format. Leave null only for repositories still on the legacy name-only format."
+  description = "Numeric ID of the repository owner (repository_owner_id claim)."
   type        = number
-  default     = null
 }
 
 variable "github_repository_id" {
-  description = "Numeric repository ID for the immutable OIDC subject format."
+  description = "Numeric ID of the repository (repository_id claim)."
   type        = number
-  default     = null
 }
 
 variable "stage" {

@@ -31,6 +31,14 @@ updates:
       frontend-tooling:
         patterns: ["*"]
 
+  # ci/requirements.txt: hash-pinned zizmor for security.yml
+  - package-ecosystem: pip
+    directory: /ci
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: terraform
     directories:
       - /infra/aws-deploy-roles

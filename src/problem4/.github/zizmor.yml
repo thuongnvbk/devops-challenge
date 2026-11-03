@@ -1,0 +1,10 @@
+# zizmor configuration (CI runs: zizmor --config .github/zizmor.yml .github/workflows)
+rules:
+  # self-repository wants `uses: $/...` (GitHub, July 2026) instead of
+  # `uses: ./...`. Our only local `uses:` are job-level reusable-workflow
+  # calls, which GitHub resolves from the caller's own commit rather than the
+  # runner's filesystem, and no released actionlint (<= 1.7.12) accepts `$/`.
+  # Switch when actionlint supports it, or immediately if the organisation
+  # enables GitHub's "require actions pinned to a full SHA" policy.
+  self-repository:
+    disable: true

@@ -17,6 +17,18 @@ locals {
   ]...)
 }
 
+# Customise the OIDC subject so the AWS trust policies can bind each role to
+# a workflow file, not only to an environment: by default any workflow that
+# declares `environment: backend-production` gets the same sub. Numeric owner
+# and repository IDs replace the name-based "repo" claim, so a re-registered
+# name cannot inherit the roles. ../aws-deploy-roles builds the exact sub
+# values from this list, in this order; change both together.
+resource "github_actions_repository_oidc_subject_claim_customization_template" "this" {
+  repository         = var.repository
+  use_default        = false
+  include_claim_keys = ["repository_owner_id", "repository_id", "context", "job_workflow_ref"]
+}
+
 resource "github_repository_environment" "this" {
   for_each = local.environments
 

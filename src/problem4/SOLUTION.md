@@ -1,6 +1,6 @@
 # Problem 4: Ship It Twice
 
-Two GitHub Actions pipelines, one per app. Each builds an artifact once, attests it, and promotes the same bytes from staging to production. The backend is an HTTP API on EC2 behind an ALB, rolled out by Auto Scaling instance refresh. The frontend is an SPA on S3 behind CloudFront, published in an order that never leaves a broken window. Both roll back automatically, and both have a one-click manual rollback that uses the same code path as a deploy.
+Two GitHub Actions pipelines, one per app, plus a repository-wide security workflow. Each builds an artifact once, attests it, and promotes the same bytes from staging to production. The backend is an HTTP API on EC2 behind an ALB, rolled out by Auto Scaling instance refresh. The frontend is an SPA on S3 behind CloudFront, published in an order that never leaves a broken window. Both roll back automatically, and both have a one-click manual rollback that uses the same code path as a deploy.
 
 ## 1. What "production ready" means here
 
@@ -8,11 +8,11 @@ Each item can be checked. Every workflow feature traces to one of them (section 
 
 | # | Requirement | Mechanism | Where |
 |---|---|---|---|
-| R1 | **Gated.** Nothing is built for release unless lint, unit tests and a dependency vulnerability scan pass on that exact commit. | `ci` job on every PR and on main. Go: gofmt, vet, staticcheck, `test -race`, govulncheck. SPA: `tsc --strict`, vitest, `npm audit`, `npm audit signatures`. | `backend.yml`, `frontend.yml` |
+| R1 | **Gated.** Nothing is built for release unless lint, unit tests and a dependency vulnerability scan pass on that exact commit. | `ci` job on every PR and on main. Go: gofmt, vet, staticcheck, `test -race`, govulncheck. SPA: `tsc --strict`, vitest, `npm audit` over the whole tree, `npm audit signatures`. | `backend.yml`, `frontend.yml` |
 | R2 | **Built once, promoted by digest.** One reproducible artifact per commit. Staging and production get identical bytes, checked against the build-time sha256 before every deploy and rollback. | Deterministic tarball; its sha256 is passed as a job output and re-verified. Both apps store artifacts in S3 create-once (`If-None-Match`), and a commit can never be re-pointed at other bytes. | `ci/deterministic-tar.sh`, `ci/s3-put-once.sh`, `*-deploy.yml`, `rollout.sh publish`, `frontend/deploy/publish.sh` |
 | R3 | **Provenance-verified.** Deploys, and SPA activations including rollbacks, reject an artifact unless it has a signed SLSA provenance attestation from this repo's build workflow, built from `main` on a GitHub-hosted runner. | `actions/attest` (provenance + SBOM), then `gh attestation verify --signer-workflow ... --source-ref refs/heads/main --deny-self-hosted-runners`. | `attest` jobs, `ci/verify-artifact.sh` |
-| R4 | **No standing credentials.** There are no AWS keys or repository secrets. Each job gets 30-60 min credentials via OIDC, for a role that only its app's environment can assume and that can do only that app's deploy. | Per-app, per-environment roles. Trust is `StringEquals` on `aud` and on `sub = repo:...:environment:<app>-<stage>`. Policies are scoped to one ASG, one launch template, one bucket prefix, one distribution. | `infra/aws-deploy-roles/` |
-| R5 | **Least privilege in CI.** Workflow default `permissions: {}`. Each job requests only what it uses. Every action is pinned to a full commit SHA. Untrusted input never reaches a shell unescaped. | Per-job `permissions`; `persist-credentials: false`; inputs passed via `env:` and regex-validated; no `pull_request_target`. Only the `attest` job holds `attestations: write`, and it runs no repository code. Deploys accept only attestations whose signer is the build workflow (`backend.yml`/`frontend.yml`), so a deploy job's own OIDC token cannot produce an acceptable one. | all workflows |
+| R4 | **No standing credentials.** There are no AWS keys or repository secrets. Each job gets 30-60 min credentials via OIDC, for a role that only that app's deploy or rollback workflow, running in that app's environment, can assume, and that can do only that app's deploy. | Per-app, per-environment roles. Trust is exact `StringEquals` on `aud` and on a customised `sub`: owner ID, repository ID, `environment:<app>-<stage>`, and `job_workflow_ref` = `<app>-deploy.yml` or `<app>-rollback.yml` on main. Policies are scoped to one ASG, one launch template, one bucket prefix, one distribution. | `infra/aws-deploy-roles/`, `infra/github-environments/` |
+| R5 | **Least privilege in CI.** Workflow default `permissions: {}`. Each job requests only what it uses. Every action is pinned to a full commit SHA. Untrusted input never reaches a shell unescaped. | Per-job `permissions`; `persist-credentials: false`; inputs passed via `env:` and regex-validated; no `pull_request_target`. Only the `attest` job holds `attestations: write`, and it runs no repository code. Deploys accept only attestations whose signer is the build workflow (`backend.yml`/`frontend.yml`), so a deploy job's own OIDC token cannot produce an acceptable one. On every change, `security.yml` runs gitleaks over the full history and zizmor over the workflows. | all workflows, `security.yml` |
 | R6 | **Controlled promotion.** Only `main` deploys. Staging is automatic and must pass before production. Production needs a second person's approval. | Four GitHub environments, each restricted to `main`. Production has reviewers, `prevent_self_review`, and no admin bypass. | `infra/github-environments/` |
 | R7 | **Serialized and forward-only.** At most one deploy or rollback per environment at a time, and the automatic path never replaces a newer release with an older one. | Job-level `concurrency: deploy-<env>`, shared with the rollback workflows, never cancelled. `ci/forward-only.sh` compares the deployed and candidate commits through the GitHub compare API. | `*-deploy.yml`, `*-rollback.yml` |
 | R8 | **No downtime.** Backend capacity never drops below desired during a deploy. The SPA never serves an `index.html` whose assets are not yet uploaded, and open tabs keep working. | Instance refresh with min 100% / max 200% healthy (launch before terminate) behind ELB health checks. SPA order: assets, then other files, then `index.html` last. Assets are never deleted. | `rollout.sh`, `frontend/deploy/activate.sh` |
@@ -43,7 +43,11 @@ Each item can be checked. Every workflow feature traces to one of them (section 
 - **Accounts and GitHub plan:**
   - Staging and production are separate AWS accounts, with one OIDC provider each.
   - The repository is public or on GitHub Enterprise Cloud; artifact attestations need one of the two.
-  - Repositories created after 2026-07-15 send the immutable OIDC subject `repo:OWNER@ID/REPO@ID:...`. The Terraform uses that format when the IDs are set (recommended, since it also defeats name re-registration) and the legacy form otherwise. GitHub documents the immutable form for `ref:` subjects; the `environment:` variant follows the same pattern but is extrapolated. Confirm it once with a job that prints its `sub` claim.
+  - **Workflow binding.** By default the OIDC `sub` is only `repo:...:environment:<name>`, so any workflow file that declares the environment would get the role. I bind roles to workflow files with GitHub's documented subject-claim customisation (`PUT /repos/{owner}/{repo}/actions/oidc/customization/sub`, Terraform `github_actions_repository_oidc_subject_claim_customization_template`) and exact `StringEquals` in IAM. The claims, in order, are `repository_owner_id`, `repository_id`, `context` and `job_workflow_ref`.
+    - I did not use IAM condition keys on `job_workflow_ref`, because I could not confirm that AWS exposes that claim for `token.actions.githubusercontent.com`.
+    - Numeric IDs replace the name-based `repo` claim, which also defeats name re-registration and sidesteps the 2026 legacy-versus-immutable `repo:` format change.
+    - The `trusted_subjects` Terraform output lists the exact strings each role accepts. Compare them once with a job that prints its token's `sub`, in both a deploy run (a reusable workflow) and a rollback run (a top-level `workflow_dispatch` job). GitHub documents `job_workflow_ref` in reusable-workflow terms; Sigstore keyless signing relies on it for every workflow, so I expect top-level jobs to carry their own file there, but that check is what confirms it before the first production rollback is needed.
+    - Residual: the binding names the called workflow, so another caller of `<app>-deploy.yml` produces the same `sub`. Environment protection (main only, required reviewer, no self-review) is what stops a new caller from reaching production.
 - **Release identity and cadence:** the release ID is the full commit SHA. Every merge to `main` is a release candidate. Delivery is continuous to staging, with approval for production.
 
 ## 3. How the pipelines work
@@ -91,7 +95,7 @@ Path filters (`backend/**` or `frontend/**`, plus `ci/**` and the app's own work
    - `npm ci --ignore-scripts` (exact lockfile; dependency install scripts never run)
    - `npm audit signatures` (registry signatures and provenance)
    - `tsc --strict`, vitest
-   - `npm audit --omit=dev --audit-level=high`. This gates on code that ships to browsers; Dependabot keeps build tooling current instead of a dev-server advisory blocking releases.
+   - `npm audit --audit-level=high` over the whole tree. Every dependency is a devDependency, and Vite, Rolldown and TypeScript are what produce the shipped bytes, so `--omit=dev` would audit nothing.
    - `vite build` with `VITE_RELEASE=<sha>`, the release-path tests, a reproducible tarball, and an SBOM.
 2. **attest**: same as the backend.
 3. **deploy**:
@@ -157,9 +161,11 @@ Open tabs on an older `index.html` keep loading their lazy chunks, because asset
 
 | Check | Command | Result |
 |---|---|---|
-| Workflow lint (with embedded shellcheck of `run:` blocks) | `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color`, on a copy of `src/problem4` with `git init` so it is the project root | 6 workflows, 0 errors |
+| Workflow lint (with embedded shellcheck of `run:` blocks) | `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color`, on a copy of `src/problem4` with `git init` so it is the project root | 7 workflows, 0 errors |
+| Workflow security | zizmor 1.31.1 (hash-pinned, `ci/requirements.txt`) with `.github/zizmor.yml` | 0 findings; one audit disabled, reason in the config |
+| Secrets | gitleaks v8.30.1 (`go run`, Go checksum database) over the full history | no leaks |
 | Scripts | `docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.10.0 ci/*.sh backend/deploy/*.sh frontend/deploy/*.sh` | clean |
-| Terraform | `terraform fmt -check -recursive`, then `init -backend=false` and `validate` in both modules | valid (aws 6.71.0, github 6.13.0; lock files committed) |
+| Terraform | `terraform fmt -check -recursive`, then `init -backend=false` and `validate` in both modules, with 1.5.0 and 1.17.1 | valid (aws 6.71.0, github 6.13.0; lock files committed) |
 | Backend | `gofmt -l`, `go vet`, `go test -race`, `staticcheck@v0.8.2`, `govulncheck@v1.9.0` on Go 1.27.3 | pass; no vulnerabilities |
 | Backend rollout | `backend/deploy/rollout_test.sh` | 20 refresh scenarios (guarded, recovery, takeover, cancel race) plus `current`, `publish`, `find` and `on-cancel` |
 | Frontend | `npm ci --ignore-scripts`, `npm audit signatures`, `npm run typecheck`, `npm test`, `npm audit` | 37 packages verified, 10 tests pass, 0 vulnerabilities |
@@ -168,7 +174,7 @@ Open tabs on an older `index.html` keep loading their lazy chunks, because asset
 | Reproducibility | build each artifact twice, compare sha256 | identical for both apps |
 | Smoke tests | against the real API binary and `vite preview` | pass on the right release, fail on the wrong one, flag missing `immutable` headers |
 
-The AWS half cannot run without an account. Every AWS call is real CLI syntax, written against current AWS docs. I couldn't verify one thing: whether `StartInstanceRefresh` with alarms checks the caller's `cloudwatch:DescribeAlarms`. If the first staging deploy says so, grant it read-only, scoped to those alarm ARNs.
+The repository-level `.github/workflows/ci.yml` exercises the CI half of these pipelines on every push; deploy jobs need AWS. The AWS half cannot run without an account. Every AWS call is real CLI syntax, written against current AWS docs. I couldn't verify one thing: whether `StartInstanceRefresh` with alarms checks the caller's `cloudwatch:DescribeAlarms`. If the first staging deploy says so, grant it read-only, scoped to those alarm ARNs.
 
 ## 7. Deliberately left out
 
@@ -177,9 +183,9 @@ The AWS half cannot run without an account. Every AWS call is real CLI syntax, w
 - **End-to-end browser tests, load tests, DAST.** Valuable, but they are product test suites, not pipeline structure. They would slot in as a staging gate between `staging` and `production`.
 - **Database migrations, runtime config and secrets.** The sample API is stateless and has no config. A real one needs expand/contract migrations decoupled from deploys, and secrets read at boot from SSM or Secrets Manager by the instance role, never baked into the artifact.
 - **Retention jobs.** Unreferenced SPA assets, old `releases/` and `backend/` objects, and launch template versions (capped at 10,000) accumulate. S3 lifecycle rules and a periodic pruning job belong to the infra stack.
-- **Required status checks with path filters.** A path-filtered workflow that doesn't run never reports, so making `ci` a required check would block unrelated PRs. In a real repo, add an always-running aggregate job and require that instead.
+- **Required status checks with path filters.** A path-filtered workflow that doesn't run never reports, so making an app's `ci` a required check would block unrelated PRs. `security.yml` always runs and can be required. For the app pipelines, add an always-running aggregate job and require that.
+- **`uses: $/...` self-repository syntax.** zizmor's `self-repository` audit is disabled in `.github/zizmor.yml`: no released actionlint (up to 1.7.12) accepts the July 2026 syntax, and GitHub resolves job-level `uses: ./...` from the caller's own commit. Switch when tooling catches up, or at once if the organisation enables GitHub's full-SHA pinning policy.
 - **Storage-enforced immutability.** Create-once is enforced by the scripts (`If-None-Match`), not by the bucket. A compromised deploy job could still overwrite a record with a plain PUT. For the SPA that yields a refused rollback, not wrong bytes: activation re-checks digest, provenance and the release stamp. For the backend, the digest pinned in the launch template is checked before every refresh and again by every booting instance. Closing even the denial case needs a bucket policy that denies `s3:PutObject` on `releases/*` and `backend/*` without `s3:if-none-match`. Object Lock alone does not do it: it protects old versions, but a plain PUT still creates a new current version that unpinned reads resolve to. Backend rollback also doesn't re-run `gh attestation verify`; it relies on the digest pinned at publish.
-- **Stronger OIDC binding.** A custom subject template that adds `job_workflow_ref` would tie each role to the deploy workflow file itself, not just the environment. It is worth adding once the environment model has settled.
 - **Runner hardening** (egress allow-listing such as harden-runner), self-hosted runners, ESLint (strict `tsc` is the static gate for this code size), chat notifications (GitHub deployment history and job summaries cover it), and multi-region.
 
 ## Files
@@ -189,10 +195,12 @@ The AWS half cannot run without an account. Every AWS call is real CLI syntax, w
 .github/workflows/backend-deploy.yml    reusable deploy to one environment
 .github/workflows/backend-rollback.yml  manual rollback
 .github/workflows/frontend*.yml         same three for the SPA
-.github/dependabot.yml                  actions, gomod, npm, terraform; 7-day cooldown
+.github/workflows/security.yml          gitleaks + zizmor on every change
+.github/zizmor.yml                      zizmor configuration
+.github/dependabot.yml                  actions, gomod, npm, pip, terraform; 7-day cooldown
 backend/                                Go API, tests, deploy/ (package, bootstrap, rollout, smoke, tests, systemd unit)
 frontend/                               Vite SPA, tests, deploy/ (release, publish, activate, current, smoke, tests)
-ci/                                     deterministic tar, create-once upload, artifact verification, forward-only guard
+ci/                                     deterministic tar, create-once upload, artifact verification, forward-only guard, hash-pinned zizmor
 infra/aws-deploy-roles/                 OIDC provider + per-app deploy roles, applied per account
 infra/github-environments/              environments, protection rules, variables
 ```

@@ -2,10 +2,12 @@
 #   terraform apply -var-file=staging.tfvars      (staging account)
 #   terraform apply -var-file=production.tfvars   (production account)
 #
-# Each role is assumable only by a GitHub Actions job that is running in the
-# matching GitHub environment of this repository. GitHub enforces that
-# environment's protection rules (main only; reviewers for production) before
-# it issues the job an OIDC token, so the trust policy inherits them.
+# Each role is assumable only by a job of this repository that (a) runs in the
+# matching GitHub environment and (b) is defined by that app's deploy or
+# rollback workflow file on main. GitHub enforces the environment's protection
+# rules (main only; reviewers for production) before it issues the OIDC token,
+# so the trust policy inherits them; (b) stops any other workflow file that
+# declares the environment from obtaining the role.
 
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
@@ -21,17 +23,33 @@ locals {
     : "arn:${local.partition}:iam::${local.account}:oidc-provider/${local.oidc_host}"
   )
 
-  repo_parts = split("/", var.github_repository)
-  subject_repo = (
-    var.github_repository_id == null
-    ? var.github_repository
-    : "${local.repo_parts[0]}@${var.github_owner_id}/${local.repo_parts[1]}@${var.github_repository_id}"
-  )
-
   # app => GitHub environment whose jobs may assume the app's role here
   apps = {
     backend  = "backend-${var.stage}"
     frontend = "frontend-${var.stage}"
+  }
+
+  # Workflow files allowed to assume each app's role. For a reusable workflow
+  # the job_workflow_ref claim names the called file, so backend.yml's deploy
+  # jobs present backend-deploy.yml.
+  workflows = {
+    backend  = ["backend-deploy.yml", "backend-rollback.yml"]
+    frontend = ["frontend-deploy.yml", "frontend-rollback.yml"]
+  }
+
+  # OIDC subject under the customisation set in ../github-environments:
+  # include_claim_keys = [repository_owner_id, repository_id, context,
+  # job_workflow_ref], rendered "key:value" in that order ("context" renders
+  # as environment:<name>). Both modules must change together.
+  subjects = {
+    for app, env in local.apps : app => [
+      for wf in local.workflows[app] : join(":", [
+        "repository_owner_id", var.github_owner_id,
+        "repository_id", var.github_repository_id,
+        "environment", env,
+        "job_workflow_ref", "${var.github_repository}/.github/workflows/${wf}@refs/heads/main",
+      ])
+    ]
   }
 
   launch_template_arn = "arn:${local.partition}:ec2:${var.aws_region}:${local.account}:launch-template/${var.launch_template_id}"
@@ -65,14 +83,14 @@ data "aws_iam_policy_document" "trust" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Exact match, no wildcards: this repository, this environment. Pull
-    # requests (sub ...:pull_request) and branch jobs (sub ...:ref:...) can
-    # never match. Verify the exact string once with a debug job printing
-    # the token's sub claim before relying on it.
+    # Exact match, no wildcards: these repository and owner IDs, this
+    # environment, one of this app's two workflow files on main. Pull requests
+    # and branch jobs carry a different context and can never match. Verify
+    # the exact string once with a debug job printing the token's sub claim.
     condition {
       test     = "StringEquals"
       variable = "${local.oidc_host}:sub"
-      values   = ["repo:${local.subject_repo}:environment:${each.value}"]
+      values   = local.subjects[each.key]
     }
   }
 }
@@ -84,13 +102,6 @@ resource "aws_iam_role" "deploy" {
   description          = "GitHub Actions ${each.value} deploys for ${var.github_repository}"
   assume_role_policy   = data.aws_iam_policy_document.trust[each.key].json
   max_session_duration = 3600
-
-  lifecycle {
-    precondition {
-      condition     = (var.github_owner_id == null) == (var.github_repository_id == null)
-      error_message = "Set both github_owner_id and github_repository_id, or neither."
-    }
-  }
 }
 
 # --- backend: publish artifact, add launch template version, drive refresh ---

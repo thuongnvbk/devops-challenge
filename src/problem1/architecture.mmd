@@ -1,0 +1,76 @@
+flowchart TB
+  subgraph CLIENTS["Clients"]
+    WEB["Web and mobile apps"]
+    BOTS["API clients and market makers"]
+  end
+
+  subgraph EDGE["AWS edge, global"]
+    R53["Route 53<br/>DNS"]
+    CF["CloudFront + WAF<br/>static assets, public REST microcache, public WebSocket"]
+    GA["Global Accelerator<br/>anycast IPs for trading REST and private WebSocket"]
+  end
+
+  subgraph PRIMARY["Primary region: ap-northeast-1 Tokyo, 3 AZs"]
+    subgraph PUB["Public subnets"]
+      ALBP["alb-public<br/>accepts CloudFront only"]
+      ALBT["alb-trading + WAF<br/>Global Accelerator endpoint"]
+    end
+    subgraph APP["App subnets: EKS general node pool"]
+      OG["order-gateway<br/>auth, validation, rate limits, produce command"]
+      QA["query-api<br/>balances, open orders, history"]
+      SGW["stream-gateway<br/>WebSocket fan-out, public and private deployments"]
+      MD["md-service<br/>L2 depth, trades, tickers, klines"]
+      PROJ["projectors<br/>ledger, account, history"]
+    end
+    subgraph CORE["Core subnets: EKS dedicated node pool, one pod per node"]
+      MC["matching-core-0, 1, 2<br/>one replica per AZ, all apply the log<br/>lease holder publishes events"]
+    end
+    subgraph DATA["Data subnets and regional services"]
+      MSK["Amazon MSK, 3 brokers, RF 3<br/>core.commands, core.events,<br/>core.account-events, core.ledger, md topics"]
+      DDB["DynamoDB<br/>publisher lease"]
+      AUR["Aurora PostgreSQL<br/>ledger, orders, trades, accounts"]
+      VK["ElastiCache for Valkey<br/>read models, rate limits"]
+      S3["S3<br/>snapshots, command-log archive, static site"]
+    end
+  end
+
+  subgraph DRREGION["DR region: ap-southeast-1 Singapore, warm standby"]
+    MSK2["MSK<br/>replicated core.commands"]
+    MCF["matching-core follower"]
+    AUR2["Aurora Global Database secondary"]
+    EKS2["EKS stateless services<br/>minimal capacity, passive until promoted"]
+    S32["S3 replica"]
+  end
+
+  R53 -.->|"alias"| CF
+  R53 -.->|"alias"| GA
+  WEB --> CF
+  WEB --> GA
+  BOTS --> GA
+  CF --> ALBP
+  GA --> ALBT
+  GA -.->|"failover endpoint group"| EKS2
+  ALBP --> MD
+  ALBP --> SGW
+  ALBT --> OG
+  ALBT --> QA
+  ALBT --> SGW
+  OG -->|"1 produce, acks=all"| MSK
+  MSK -->|"2 every replica applies in log order"| MC
+  MC -->|"3 replies, publisher preferred"| OG
+  MC -->|"4 transactional publish"| MSK
+  MC -.->|"lease"| DDB
+  MC -->|"snapshots"| S3
+  OG --> VK
+  MSK --> MD
+  MD --> MSK
+  MSK --> SGW
+  MSK --> PROJ
+  PROJ --> AUR
+  PROJ --> VK
+  QA --> VK
+  QA --> AUR
+  MSK ==>|"MSK Replicator, async"| MSK2
+  MSK2 --> MCF
+  AUR ==>|"storage replication, async"| AUR2
+  S3 ==>|"Cross-Region Replication"| S32

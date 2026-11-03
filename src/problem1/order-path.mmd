@@ -1,0 +1,21 @@
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant ALB as alb-trading
+  participant OG as order-gateway
+  participant K as MSK core.commands
+  participant P as core replica, publisher
+  participant S as core replicas, standby
+  participant E as MSK output topics
+  C->>ALB: POST /api/v1/order with signature and clientOrderId
+  ALB->>OG: forward
+  OG->>K: produce, idempotent, acks=all
+  K-->>OG: ack, in-sync replicas in 2+ AZs have it
+  K->>P: fetch
+  K->>S: fetch
+  P->>P: dedupe, hold funds, match, settle
+  P-->>OG: result with generation, seq, state hash
+  S-->>OG: result, used only if the publisher is 10 ms late
+  OG-->>ALB: 200 with status, fills, seq
+  ALB-->>C: response
+  P->>E: transaction every 5 ms, ends with a watermark

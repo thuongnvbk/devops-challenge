@@ -156,6 +156,8 @@ flowchart TB
   S3 ==>|"Cross-Region Replication"| S32
 ```
 
+Rendered: [architecture.svg](architecture.svg) ([source](architecture.mmd)).
+
 | Component | Runs on | Role |
 |---|---|---|
 | `order-gateway` | EKS general pool, 2 pods per AZ | REST order API: auth, validation, rate limits, produce to `core.commands`, return the core's reply |
@@ -185,7 +187,7 @@ sequenceDiagram
   C->>ALB: POST /api/v1/order with signature and clientOrderId
   ALB->>OG: forward
   OG->>K: produce, idempotent, acks=all
-  K-->>OG: ack, durable in at least 2 AZs
+  K-->>OG: ack, in-sync replicas in 2+ AZs have it
   K->>P: fetch
   K->>S: fetch
   P->>P: dedupe, hold funds, match, settle
@@ -195,6 +197,8 @@ sequenceDiagram
   ALB-->>C: response
   P->>E: transaction every 5 ms, ends with a watermark
 ```
+
+Rendered: [order-path.svg](order-path.svg) ([source](order-path.mmd)).
 
 **Engineering allocation for place/cancel (milliseconds)**
 
@@ -217,8 +221,9 @@ These numbers are allocations for engineering work, not a percentile bound. Tail
 
 | Outcome | When | What the client does |
 |---|---|---|
-| Rejected | Only when a check fails *before* the command is handed to the producer: auth, validation, rate limit, load shedding | Fix the request or back off |
-| Accepted, result pending | The produce was acknowledged, but no core reply arrived by the 1 s API deadline. The command is durable and will execute, unless it is lost in a regional failover (G7) | Read the result from the user stream |
+| Rejected before handoff | A gateway check fails before producing: auth, validation, per-IP/per-key rate limit, load shedding | Fix the request or back off |
+| Rejected by the core | A business rule refused it, with no state change: balance, price band, per-account order-rate or open-order limit, unfillable FOK (4.1) | Final; fix the request |
+| Accepted, result pending | The produce was acknowledged, but no core reply arrived by the 1 s API deadline. The command is in the replicated log and will execute, unless it is lost in a regional failover (G7) | Read the result from the user stream |
 | Outcome unknown | Any producer error or timeout after handoff. The command may or may not be in the log (Binance's `-1007` contract) | Query the order, or resubmit the same `clientOrderId` (section 4.2) |
 
 Producer timeouts (Appendix A) satisfy Kafka's rule `delivery.timeout.ms >= request.timeout.ms + linger.ms`. The gateway enforces the 1 s API deadline separately.
@@ -327,7 +332,7 @@ Liveness comes from the lease, safety from Kafka. A publisher steps down only wh
 
 | Data path | Choice | Under failure |
 |---|---|---|
-| Order acceptance, matching, trading balances | **Consistency** | Nothing is acknowledged unless it is durable in 2+ AZs. Publisher failover pauses publication rather than risk two writers |
+| Order acceptance, matching, trading balances | **Consistency** | Nothing is acknowledged until the in-sync replicas in 2+ AZs have it (replicated in memory, not fsynced). Publisher failover pauses publication rather than risk two writers |
 | Balance and open-order reads | **Availability**, with staleness visible through `seq` | Valkey; falls back to an Aurora reader |
 | Market data | **Availability** | Clients detect gaps by sequence id and resync; conflation under load |
 | Aurora ledger | Eventually consistent with the core (G11) | A backlog builds in Kafka during an Aurora failover, then drains |
@@ -349,6 +354,7 @@ Liveness comes from the lease, safety from Kafka. A publisher steps down only wh
 | Valkey primary | Reads fall back to Aurora; rate limits fall back to per-pod buckets | Automatic failover; projector refills |
 | DynamoDB | No publisher failover possible meanwhile; trading continues | Wait |
 | Divergence, poison command | Sections 4.3 and 4.5 | |
+| Logical corruption, bad release, operator error | Replicated too: the DR log carries a poison command, Aurora Global Database a bad write. DR is no defense | End of 8.2 |
 | Region | G7, G8 | Section 8.2 |
 
 **Regional RPO/RTO by component.** Core and command log: G7, G8. Aurora: Global Database lag is typically under 1 s, and it is repaired at promotion (step 5). Valkey: rebuilt from the DR core's snapshot. S3: Cross-Region Replication within minutes, not on the recovery path. Stateless services: Karpenter, within G8.
@@ -376,6 +382,10 @@ Liveness comes from the lease, safety from Kafka. A publisher steps down only wh
 
 **Drills.** Every quarter in staging; a planned switchover in production once a year.
 
+**Corruption, bad releases and operator error** (DR replicates them; recover from known-good state):
+- **Core:** the log is intact, so command RPO is 0. Two cases. A poison command crashes every replica, and nothing later in the log (cancels or a corrective command included) can apply past it, so trading is fully halted until a fixed build passes the replay gate (12) through that command and replays from the last good snapshot: RTO is hours. A bad release that runs but computes wrong outcomes leaves the core working, so a corrective operator command (cancel-only, `SetConfig`) applies within minutes while the fix ships. Differing published outcomes become trade corrections (4.3).
+- **Aurora:** PITR (35-day retention) plus daily AWS Backup copies to Singapore. Ledger and history can also be re-projected from the S3 archive (RPO 0); order entry is unaffected.
+
 ---
 
 ## 9. Service choices and alternatives
@@ -388,7 +398,7 @@ Liveness comes from the lease, safety from Kafka. A publisher steps down only wh
 | **ALB x2** | `alb-public` (CloudFront origin only) and `alb-trading` (Global Accelerator endpoint) | **NLB:** no L7 routing or WAF; Stage 4. **API Gateway:** $1.00-3.50 per million (us-east-1, tiered) is ~$1k-3k/month for ~0.9B authenticated requests, plus a hop | Cheapest L7 at sustained rps; two ALBs keep two trust zones |
 | **EKS** | All services; the core on a tainted pool with the static CPU manager | **ECS on Fargate:** no CPU pinning. **ECS on EC2:** sufficient. **Lambda:** wrong fit for long-lived consumers, sockets and in-memory state | Team fit (A5), plus Karpenter, Argo Rollouts, PodDisruptionBudgets and topology spread |
 | **EC2 Graviton** (`c7g`, `m7g`) | Compute | `c7i` for the core | About 20% below the x86 hourly price. The core is benchmarked on both, because single-thread tail latency decides it |
-| **Amazon MSK** (provisioned, KRaft, 3x `kafka.m7g.large`) | The sequencer (`core.commands`) and the event bus | **Kinesis:** AWS documents ~70 ms average propagation with enhanced fan-out (~200 ms polling), and no transactional fencing. **Aeron Cluster:** lowest latency, self-operated; Stage 4. **SQS FIFO:** no replay. **MSK Express:** faster recovery at ~2x the broker price | Total order, durable cross-AZ acks, replay, and the transactional fencing the failover design relies on |
+| **Amazon MSK** (provisioned, KRaft, 3x `kafka.m7g.large`) | The sequencer (`core.commands`) and the event bus | **Kinesis:** AWS documents ~70 ms average propagation with enhanced fan-out (~200 ms polling), and no transactional fencing. **Aeron Cluster:** lowest latency, self-operated; Stage 4. **SQS FIFO:** no replay. **MSK Express:** faster recovery at ~2x the broker price | Total order, cross-AZ replicated acks, replay, and the transactional fencing the failover design relies on |
 | **DynamoDB** | The publisher lease | **Kubernetes Lease:** ties trading to the EKS control plane. **Kafka group membership:** 6 s default session-timeout floor. **etcd/ZooKeeper:** another quorum to run | Strongly consistent conditional writes in an independent failure domain, for a few dollars a month |
 | **Aurora PostgreSQL** (writer + reader, `db.r7g.xlarge`) | Ledger, order and trade history, accounts | **RDS PostgreSQL:** weaker cross-region DR. **DynamoDB:** awkward for balanced entries and reconciliation SQL; used for history in Stage 2. **Aurora DSQL:** its write latency buys nothing for a ledger off the hot path | Relational constraints, SQL for finance, six-way storage, Global Database |
 | **ElastiCache for Valkey** | Account read model, rate limits, key and ticker caches | **MemoryDB:** pays for durability on data that can be rebuilt. **Redis OSS:** same API at a higher price | Sub-millisecond reads at about 20% below the Redis OSS node price |
@@ -400,6 +410,18 @@ Liveness comes from the lease, safety from Kafka. A publisher steps down only wh
 | **KMS, Secrets Manager** | Encryption at rest, credentials | | Problem 5 |
 
 Not used on any trading path: Lambda, Step Functions, SNS/SQS, API Gateway, Kinesis. Each fails the latency budget or duplicates an existing component.
+
+**Why not a single Postgres writer?** The obvious alternative: each command is one ACID transaction on Aurora PostgreSQL (reserve, match against book rows, write fills, postings and an outbox row), one writer per symbol group, RDS Proxy in front.
+
+| At 200 commands/s | Postgres single writer | Replicated state machine (this design) |
+|---|---|---|
+| Latency | One quorum commit per command: low single-digit ms plus lock waits; fits G1 | ~30 ms allocated, mostly MSK |
+| Throughput ceiling | A hot account's balance row serializes its orders at commit latency, roughly 200-500/s; across symbol-group writers, shared balances need a balance service or 2PC | In-memory balances; 20k commands/s benchmark target (4.1) |
+| Failover | Writer loss: 30-60 s without order entry; RDS Proxy shortens reconnects only | Replica loss: no pause (G6); broker crash ~10-15 s (G5) |
+| Ops burden | Low: one familiar database, PITR, no custom replay or fencing | High: determinism, replay gate, snapshots, fencing |
+| Breaks when | Hot-account row ceiling, writer CPU, or failovers exhausting G9's ~20 min budget | Stage 3 triggers (11) |
+
+At launch volume Postgres meets the brief and is the simpler, defensible choice; a team without appetite for deterministic code should start there, keeping this command and event schema so moving later is a migration. We choose the log for an order path without writer failover, replay as the one recovery and DR mechanism, and no hot-row ceiling.
 
 ---
 

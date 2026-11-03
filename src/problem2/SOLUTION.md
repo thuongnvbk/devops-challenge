@@ -43,11 +43,17 @@ ext4 keeps 5% of blocks for root (3.2 GB of 64 GB). `df` shows 100% once *non-ro
 ### 1.2 Size the incident (5 minutes)
 
 ```bash
-df -hT /; df -i /                       # blocks or inodes? which device?
+MNT=/   # the alert's mountpoint; §1-§2 reuse MNT and DEV
+DEV=$(findmnt -n -o SOURCE -T "$MNT")
+df -hT "$MNT"; df -i "$MNT"                  # blocks or inodes?
+findmnt -n -o OPTIONS -T "$MNT"              # "ro": storage fault, not a full disk
+sudo dmesg -T | grep -iE 'EXT4-fs (error|warning)|I/O error|read-only' | tail -n 20   # older: journalctl -k
 sudo tail -n 5000 /var/log/nginx/error.log | grep -c 'No space left on device'
-a=$(df -B1 --output=avail / | tail -n1); sleep 60; b=$(df -B1 --output=avail / | tail -n1)
+a=$(df -B1 --output=avail "$MNT" | tail -n1); sleep 60; b=$(df -B1 --output=avail "$MNT" | tail -n1)
 echo "consuming $(( (a - b) / 60 )) B/s, $b B left for non-root writers"
 ```
+
+Read-only or kernel storage errors: catalogue row 16 before freeing anything. If SSH hangs (I/O errors leave processes in D state), use the serial console or SSM Session Manager.
 
 The error log sits on the same full disk, so zero ENOSPC lines proves nothing. Get the truth from outside the box: edge 5xx rate, plus a synthetic check that downloads a large object and compares bytes received with `Content-Length`, because truncation is logged as success.
 
@@ -57,14 +63,16 @@ Severity: user-facing errors now → SEV2 (SEV1 if this LB is the only path for 
 
 Every risky step is defined once, here. The rest of the document refers back to these steps.
 
+**Evidence first, time-boxed by time-to-full.** With tens of minutes left, ship rotated logs before deleting them (or record a waiver), and before USR1 releases a deleted log, save its tail: `sudo tail -c 512M /proc/<PID>/fd/<FD> > /dev/shm/<name>.tail` (mind free RAM), then copy it off-box. With minutes left, mitigate first and record what was lost.
+
 | # | Action | Command | Frees | Risk |
 |---|---|---|---|---|
-| 1 | Remove what nothing holds open: compressed rotated logs (ship first if retention requires), apt cache, archived journal | `sudo rm /var/log/nginx/*.gz`; `sudo apt-get clean`; journal per **B** | Usually GBs | None |
-| 2 | Make NGINX reopen its logs | `sudo kill -USR1 "$(cat /run/nginx.pid)"`, then `sudo lsof -nP -a +L1 /` to see what is still held | A deleted log, once no other process holds it. A still-linked `access.log.1` frees nothing; it only stops growing (clear it with 1 or **A**) | None. Works even if the on-disk config is broken, unlike `nginx -s reopen` |
+| 1 | Remove what nothing holds open: compressed rotated logs (ship first if retention requires), apt cache, archived journal | `sudo rm /var/log/nginx/*.gz`; `sudo apt-get clean`; journal per **B** | Usually GBs | Evidence loss: ship the logs first or waive (above) |
+| 2 | Make NGINX reopen its logs | Save deleted logs' tails first (above); `sudo kill -USR1 "$(cat /run/nginx.pid)"`, then `sudo lsof -nP -a +L1 "$MNT"` to see what is still held | A deleted log, once no other process holds it. A still-linked `access.log.1` frees nothing; it only stops growing (clear it with 1 or **A**) | None. Works even if the on-disk config is broken, unlike `nginx -s reopen` |
 | 3 | A deleted file held by another process | A shipper holding a rotated log: restart the shipper (not the LB). Agent queues and WALs: **C**. Truncate via `/proc/<PID>/fd/<FD>` only a file positively identified as a disposable log | Its size | Truncating anything else (a queue, a WAL, a memory-mapped file, NGINX's request buffers) can corrupt state or crash the holder |
 | 4 | A huge live log | **A** | Its size | None |
-| 5 | Grow capacity online, no restart | VG has free space: `sudo lvextend -r -L +20G /dev/ubuntu-vg/ubuntu-lv`. Cloud disk: resize the volume, then `sudo env TMPDIR=/dev/shm growpart /dev/nvme0n1 1` (growpart needs scratch space, so keep it off the full disk) and `sudo resize2fs /dev/nvme0n1p1`. Under LVM, `pvresize` the PV, then `lvextend -r`. Names from `lsblk` | As much as you add | None, but it only buys time. EBS rate-limits modifications of a volume, so check the current limit before counting on a second resize |
-| 6 | Seconds-to-full emergency only: lend NGINX part of the root reserve | Record the current value first: `sudo tune2fs -l "$(findmnt -n -o SOURCE /)" \| grep -E '^(Block\|Reserved block) count'`. If it is above 1%: `sudo tune2fs -m 1 <dev>` | Reserve minus 1% (4% at the default 5%), instantly (verified online) | Spends root's safety margin. Restore the recorded value once there is headroom; never `-m 0` |
+| 5 | Grow capacity online, no restart | Snapshot the volume first (online, crash-consistent). VG has free space: `sudo lvextend -r -L +20G /dev/ubuntu-vg/ubuntu-lv`. Cloud disk: resize the volume, then `sudo env TMPDIR=/dev/shm growpart /dev/nvme0n1 1` (growpart needs scratch space, so keep it off the full disk) and `sudo resize2fs /dev/nvme0n1p1`. Under LVM, `pvresize` the PV, then `lvextend -r`. Names from `lsblk` | As much as you add | None, but it only buys time. EBS rate-limits modifications of a volume, so check the current limit before counting on a second resize |
+| 6 | Seconds-to-full emergency only: lend NGINX part of the root reserve | Record the current value first: `sudo tune2fs -l "$DEV" \| grep -E '^(Block\|Reserved block) count'`. If it is above 1%: `sudo tune2fs -m 1 "$DEV"` | Reserve minus 1% (4% at the default 5%), instantly (verified online) | Spends root's safety margin. Restore the recorded value once there is headroom; never `-m 0` |
 
 **A. Export a live log without losing lines or overwriting evidence.**
 
@@ -94,7 +102,7 @@ After each step, check that `avail` rises, no new ENOSPC lines appear, and the l
 ## 2. Diagnosis: read-only, in this order
 
 Ground rules on a hot, full box: `export TMPDIR=/dev/shm` first so sorts spill to RAM; walk the filesystem with `nice`/`ionice` and `-x`/`-xdev`; stream output to your workstation rather than the full disk; don't install tools (`ncdu`) onto it. [`scripts/diagnose-disk.sh`](scripts/diagnose-disk.sh) runs every step below in one pass and ends with a Findings list. It saves nothing and points temp spill (`sort`, `growpart -N`) at tmpfs:
-`ssh lb-01 'sudo bash -s -- /' < scripts/diagnose-disk.sh > lb-01-disk.txt`.
+`ssh lb-01 "sudo bash -s -- $MNT" < scripts/diagnose-disk.sh > lb-01-disk.txt` (without root it lists skipped probes and exits 3).
 
 **Step 1: is the alert right? Which mount, which resource?**
 
@@ -114,7 +122,7 @@ findmnt -T /var/log/nginx; findmnt -T /var/lib/nginx
 lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
 sudo vgs; sudo lvs; sudo pvs -o pv_name,pv_size,dev_size
 sudo env TMPDIR=/dev/shm growpart -N /dev/nvme0n1 1   # dry run, scratch in RAM: CHANGE means unpartitioned space follows
-sudo tune2fs -l "$(findmnt -n -o SOURCE /)" | grep -E '^(Block count|Reserved block count|Block size):'
+sudo tune2fs -l "$DEV" | grep -E '^(Block count|Reserved block count|Block size|Filesystem state|FS Error count):'
 ```
 
 - **ISO installs:** the 24.04 server installer's guided layout uses LVM with sizing policy `scaled`, which gives the root LV *half* the volume group on disks of 20-200 GiB (subiquity `scaled_rootfs_size`, checked at tags 24.04.1 and 24.04.5). On 64 GiB that is a ~1 GiB ESP, a 2 GiB `/boot`, a ~61 GiB VG and a **~30 GiB root LV, with ~30 GiB unallocated**. The "64 GB disk at 99%" may be a 30 GB filesystem. Fix: §1.3 step 5.
@@ -123,25 +131,25 @@ sudo tune2fs -l "$(findmnt -n -o SOURCE /)" | grep -E '^(Block count|Reserved bl
 **Step 3: df vs du. Is space held by files you can't see?**
 
 ```bash
-df -B1 --output=used /          # the filesystem's view
-sudo du -sxB1 /                 # files reachable by name on this filesystem
-sudo lsof -nP -a +L1 /          # open files with link count 0, on / only
+df -B1 --output=used "$MNT"      # the filesystem's view
+sudo du -sxB1 "$MNT"             # files reachable by name on this filesystem
+sudo lsof -nP -a +L1 "$MNT"      # open files with link count 0, on this filesystem only
 ```
 
-`-a` matters: without it lsof ORs the two selections and lists every open file on `/`. A large gap comes from one of three places:
+`-a` matters: without it lsof ORs the two selections and lists every open file on the filesystem. A large gap comes from one of three places:
 
 1. **Logs rotated or `rm`'ed while NGINX holds them:** `access.log (deleted)` held by the master and every worker.
 2. **NGINX buffer files:** nginx unlinks ordinary proxy and client-body buffer files right after creating them, so they only appear here, e.g. `/var/lib/nginx/proxy/1/00/0000000001 (deleted)` (verified). They free themselves when the request ends, so a `du` of `/var/lib/nginx` near zero tells you nothing. Two exceptions are linked and visible to `du`: cache fills, which write a named temp file that is renamed into the cache, and `client_body_in_file_only on`, which keeps every request body on disk forever (verified).
 3. **Files shadowed by a mount point,** written before a volume was mounted over the directory. List them through a read-only bind mount:
-   `sudo mkdir -p /mnt/rootfs && sudo mount -o bind,ro / /mnt/rootfs && sudo du -xh -d2 /mnt/rootfs/var | sort -rh | head; sudo umount /mnt/rootfs`
+   `sudo mkdir -p /mnt/rootfs && sudo mount -o bind,ro "$MNT" /mnt/rootfs && sudo du -xh -d2 /mnt/rootfs | sort -rh | head; sudo umount /mnt/rootfs`
 
 **Step 4: what is big, and what is growing now?**
 
 ```bash
-sudo nice -n19 ionice -c3 du -xh -d2 / 2>/dev/null | sort -rh | head -n 20
-sudo find / -xdev -type f -size +500M -printf '%s\t%TY-%Tm-%Td %TH:%TM\t%p\n' 2>/dev/null | sort -rn | numfmt --to=iec-i --field=1 | head -n 20
-sudo find / -xdev -type f -mmin -60 -size +50M -printf '%s\t%p\n' 2>/dev/null | sort -rn | numfmt --to=iec-i --field=1 | head
-sudo du --inodes -x -d3 / 2>/dev/null | sort -rn | head -n 15     # only if df -i is high
+sudo nice -n19 ionice -c3 du -xh -d2 "$MNT" 2>/dev/null | sort -rh | head -n 20
+sudo find "$MNT" -xdev -type f -size +500M -printf '%s\t%TY-%Tm-%Td %TH:%TM\t%p\n' 2>/dev/null | sort -rn | numfmt --to=iec-i --field=1 | head -n 20
+sudo find "$MNT" -xdev -type f -mmin -60 -size +50M -printf '%s\t%p\n' 2>/dev/null | sort -rn | numfmt --to=iec-i --field=1 | head
+sudo du --inodes -x -d3 "$MNT" 2>/dev/null | sort -rn | head -n 15     # only if df -i is high
 ```
 
 **Step 5: NGINX and its log rotation.**
@@ -196,9 +204,9 @@ Ranked by general likelihood on a dedicated NGINX LB. "Immediate" actions are sa
 | 3 | **`proxy_cache` unbounded or mis-sized;** orphaned cache dirs after a zone or path rename | `du` of each `proxy_cache_path`; no `max_size`, or `max_size` close to disk size; dirs under the cache root that no `proxy_cache_path` uses | Flat at 99% or a ramp; cache fills fail with empty replies; upstream load rises | Lower `max_size`, add `min_free`, `nginx -t && systemctl reload nginx` (change only those: a new path or zone name orphans the old cache); delete orphaned dirs (NGINX never evicts them) | Cache on its own volume; `max_size` ≤ 70% of it plus `min_free`; alert on that volume |
 | 4 | **Filesystem smaller than the disk:** installer-default root LV, or partition/fs not grown after a volume resize | `vgs` VFree; disk > partition in `lsblk`; `growpart -N` reports CHANGE; fs block count × block size < device | A "64 GB" alert on a ~30 GB fs | §1.3 step 5 | Pin the layout in IaC/autoinstall (`sizing-policy: all` or explicit sizes); deliberately leave ~10% of the VG free as break-glass |
 | 5 | **Verbose `error_log`** (`debug`/`info`) or an error flood (upstream timeouts, `no live upstreams`, TLS handshake noise) | `error.log` large and fast-growing; `[debug]` lines; `error_log` level in `nginx -T` | GB/hour at debug. Ubuntu's nginx is built `--with-debug`, so `debug` really logs | Set `warn`; `nginx -t && systemctl reload nginx`; clear `error.log` with §1.3 **A** | CI lint rejects `debug`; use `debug_connection <ip>` for targeted debugging |
-| 6 | **Temp buffering:** large responses to slow clients (up to 1 GiB each), large uploads (`client_max_body_size` raised or `0`); `client_body_in_file_only on` keeping every body | `lsof -a +L1 /` shows `/var/lib/nginx/{proxy,body}/… (deleted)`; for `in_file_only`, linked files piling up in `/var/lib/nginx/body` | Bursty: 200 slow clients × 1 GiB = 200 GiB of demand. `in_file_only on` is a steady ramp | Live buffers: nothing to delete. Rate-limit the offender, lower `proxy_max_temp_file_size`, reload (in-flight requests keep the old config). Retained bodies: set `clean` or `off`, reload, delete old files | Temp paths on the cache volume; per-location body limits; for uploads, `proxy_request_buffering off` plus `proxy_http_version 1.1` (chunked bodies are still buffered over HTTP/1.0, and retries can't resend an unbuffered body); `proxy_buffering off` for streaming endpoints |
+| 6 | **Temp buffering:** large responses to slow clients (up to 1 GiB each), large uploads (`client_max_body_size` raised or `0`); `client_body_in_file_only on` keeping every body | `lsof -a +L1 "$MNT"` shows `/var/lib/nginx/{proxy,body}/… (deleted)`; for `in_file_only`, linked files piling up in `/var/lib/nginx/body` | Bursty: 200 slow clients × 1 GiB = 200 GiB of demand. `in_file_only on` is a steady ramp | Live buffers: nothing to delete. Rate-limit the offender, lower `proxy_max_temp_file_size`, reload (in-flight requests keep the old config). Retained bodies: set `clean` or `off`, reload, delete old files | Temp paths on the cache volume; per-location body limits; for uploads, `proxy_request_buffering off` plus `proxy_http_version 1.1` (chunked bodies are still buffered over HTTP/1.0, and retries can't resend an unbuffered body); `proxy_buffering off` for streaming endpoints |
 | 7 | **journald / rsyslog**, fed by an LB-typical flood: `nf_conntrack: table full`, SYN-flood warnings, SSH brute force (`auth.log`, `btmp`) | `journalctl --disk-usage`; size of `/var/log/syslog*`, `kern.log`, `auth.log`, `btmp`; drop-ins raising `SystemMaxUse` | Persistent journal defaults to min(10% of fs, 4G) and keeps min(15%, 4G) free, so it is usually a contributor, not the cause. rsyslog's files rotate only weekly | §1.3 **B**, then stop the flood | `SystemMaxUse=1G` drop-in; never route access logs through syslog |
-| 8 | **Agent buffers:** the log shipper or metrics agent spooling to disk while its backend is down (Fluent Bit `storage.path`, Vector disk buffers, Alloy/Prometheus-agent WAL), or holding rotated logs open while it lags | `du` of `/var/lib/{fluent-bit,vector,alloy}` or the configured buffer path; the holder in `lsof -a +L1 /` is the agent; agent logs show output errors | Ramp that starts when the backend went down; deleted logs held by the agent | **Not live-safe:** §1.3 **C** | Cap buffers (Fluent Bit `storage.total_limit_size`, Vector `buffer.max_size`); alert on agent output errors |
+| 8 | **Agent buffers:** the log shipper or metrics agent spooling to disk while its backend is down (Fluent Bit `storage.path`, Vector disk buffers, Alloy/Prometheus-agent WAL), or holding rotated logs open while it lags | `du` of `/var/lib/{fluent-bit,vector,alloy}` or the configured buffer path; the holder in `lsof -a +L1 "$MNT"` is the agent; agent logs show output errors | Ramp that starts when the backend went down; deleted logs held by the agent | **Not live-safe:** §1.3 **C** | Cap buffers (Fluent Bit `storage.total_limit_size`, Vector `buffer.max_size`); alert on agent output errors |
 | 9 | **Crash dumps** | `/var/crash/*.crash` (apport ships on server images); `core_pattern`; `exited on signal 11 (core dumped)` in `error.log`; `worker_rlimit_core` | Disk usage, plus the real problem: workers crashing and dropping connections | Copy off for analysis, then delete | Fix the crasher (often a third-party module); cap dumps |
 | 10 | **OS leftovers:** apt cache, old kernels, disabled snap revisions | `du` of `/var/cache/apt/archives`, `/usr/lib/modules`; `snap list --all` | Rarely over 2-3 GB: a quick win, rarely the cause | §1.3 step 1; `snap remove <name> --revision=<rev>`; `apt autoremove --purge` once there is room | Keep `Unattended-Upgrade::Remove-Unused-Kernel-Packages` at its default (`true`); `snap set system refresh.retain=2` |
 | 11 | **Static blobs:** pcaps, tarballs, copied logs, backups; the installer's `/swap.img` (curtin sizes it from RAM, up to 8 GiB) | `find -size +500M`; `/root`, `/home`, `/tmp`, `/var/tmp`; `swapon --show` | A static blob (flat graph) | Confirm the owner, move off-box, delete. Leave an active swapfile alone (§4) | A scratch volume with a TTL; `tcpdump -C 100 -W 10` ring buffers |
@@ -206,6 +214,7 @@ Ranked by general likelihood on a dedicated NGINX LB. "Immediate" actions are sa
 | 13 | **Hidden or misplaced data:** files under a mount point; a data volume that failed to mount (`nofail`), so NGINX wrote cache/logs to `/` | df/du gap with empty `lsof +L1`; read-only bind mount; `findmnt --verify`; `findmnt -T /var/cache/nginx` resolves to `/` | Fills root silently | Mount properly, move the data | `RequiresMountsFor=` on `nginx.service`; alert on the mount being present |
 | 14 | **NGINX in Docker** | `/var/lib/docker/containers/*/*-json.log` | The json-file log driver has no size limit by default | **Not safe, emergency only:** Docker does not support editing these files, though `truncate -s 0` is the usual last resort. Otherwise set `max-size` and recreate the container in a window, which is a restart on a single LB | `log-opts` `max-size`/`max-file` in `daemon.json` (applies to new containers) |
 | 15 | **Monitoring on the wrong mount or metric** | Alert labels vs `df` | False alarm, or a real problem hidden | Fix the query | Alert per real mount (`fstype=~"ext4\|xfs"`), on `avail` |
+| 16 | **Filesystem errors or read-only remount:** a fault that looks like a full disk | `findmnt -n -o OPTIONS` shows `ro`; `EXT4-fs error` or `I/O error` in `dmesg -T`/`journalctl -k`; `tune2fs -l` state `clean with errors` or an `FS Error count` | All writes fail: NGINX cannot log, buffer or cache | **Not live-safe.** Never `mount -o remount,rw` blindly. Snapshot the volume; fail over only to a verified peer; `fsck` only unmounted (rescue instance); replace the instance or restore the volume | LB rebuildable from IaC; `FilesystemReadOnly` and kernel-error alerts |
 
 ### 3.3 The ones that bite
 

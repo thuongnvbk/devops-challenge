@@ -11,8 +11,8 @@
 #
 # Tunables (environment): TOP=15  LARGE_MB=256  SCAN_TIMEOUT=300 (seconds per walk)
 #
-# Run as root. Otherwise /proc/<pid>/fd of other users (NGINX workers run as
-# www-data) and root-only directories are invisible and the report under-counts.
+# Run as root. Without it, root-only probes are skipped and listed at the end
+# (exit status 3), and walks under-count unreadable directories.
 # Only exception to "read-only": `nginx -T`, like any NGINX config test, would
 # create a configured log file or temp directory if one were missing.
 
@@ -34,6 +34,14 @@ done
 
 FINDINGS=()
 finding() { FINDINGS+=("$*"); }
+SKIPPED=()
+# Gate for root-only probes: record and continue instead of aborting.
+need_root() {
+  [[ $EUID -eq 0 ]] && return 0
+  SKIPPED+=("$*")
+  echo "  skipped (needs root): $*"
+  return 1
+}
 have() { command -v "$1" >/dev/null 2>&1; }
 section() { printf '\n== %s\n' "$*"; }
 # A failing probe is reported, never fatal to the report.
@@ -51,7 +59,10 @@ h() { numfmt --to=iec-i --suffix=B -- "$1"; }
 first_line_num() { awk 'NR == 2 { gsub(/[^0-9]/, ""); print; exit }'; }
 
 [[ -e ${1:-/} ]] || { echo "usage: $0 [PATH]  (PATH must exist; its mount is analysed)" >&2; exit 2; }
-[[ $EUID -eq 0 ]] || echo "WARNING: not running as root; results will under-count." >&2
+if [[ $EUID -ne 0 ]]; then
+  echo "WARNING: not running as root; root-only probes are skipped and listed at the end." >&2
+  SKIPPED+=("other users' open files and unreadable directories (partial counts)")
+fi
 
 TARGET=$(findmnt -n -o TARGET -T "${1:-/}")
 SOURCE=$(findmnt -n -o SOURCE -T "$TARGET")
@@ -76,6 +87,29 @@ if ((AVAIL < SIZE / 100)); then
   finding "Non-root writers are at or near ENOSPC (avail $(h "$AVAIL")). NGINX workers run as www-data and cannot use the $(h "$RESERVED") root reserve: expect truncated proxied responses, 500s on buffered request bodies, failed cache fills, lost log lines."
 fi
 
+section "Storage health (a read-only or failing filesystem looks like a full one)"
+OPTS=$(findmnt -n -o OPTIONS -T "$TARGET")
+echo "mount options: $OPTS"
+if [[ ,$OPTS, == *,ro,* ]]; then
+  finding "$TARGET is mounted read-only: every write fails. Treat it as a storage fault, not a full disk (SOLUTION.md catalogue row 16): do not remount rw."
+fi
+# Kernel names of the device and everything under it (LV, partition, disk).
+NAMES=$(lsblk -sn -o KNAME "$SOURCE" 2>/dev/null | paste -sd '|' || true)
+if [[ -z $NAMES ]]; then
+  echo "no block device behind $TARGET; kernel log check skipped"
+elif need_root "kernel log for ext4 and I/O errors"; then
+  KLOG=$(dmesg -T 2>/dev/null) || KLOG=$(journalctl -k -b --no-pager 2>/dev/null) || KLOG=""
+  KERR=$(printf '%s\n' "$KLOG" | grep -E "($NAMES)([^0-9a-z]|$)" | grep -iE 'error|read-only' | tail -n 10 || true)
+  if [[ -z $KLOG ]]; then
+    echo "kernel log unreadable (dmesg and journalctl -k both failed): check it by hand"
+  elif [[ -n $KERR ]]; then
+    printf '%s\n' "$KERR"
+    finding "The kernel has logged errors for $SOURCE since boot (timestamps in Storage health). If they are recent or the mount is ro, it is a storage fault first (SOLUTION.md catalogue row 16)."
+  else
+    echo "kernel log: no ext4 or I/O errors for $NAMES"
+  fi
+fi
+
 section "Real filesystems (snap squashfs loops always read 100% and are excluded)"
 probe df -hT -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs
 section "Inodes"
@@ -89,9 +123,12 @@ done
 
 section "Block devices and layout"
 probe lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
-if [[ $FSTYPE == ext4 && -b $SOURCE ]] && have tune2fs; then
-  read -r BCOUNT BSIZE < <(tune2fs -l "$SOURCE" 2>/dev/null |
-    awk -F: '/^Block count/ { c = $2 } /^Block size/ { s = $2 } END { printf "%.0f %.0f\n", c, s }')
+if [[ $FSTYPE == ext4 && -b $SOURCE ]] && have tune2fs && need_root "ext4 superblock (size, error state)"; then
+  read -r BCOUNT BSIZE ERRS < <(tune2fs -l "$SOURCE" 2>/dev/null |
+    awk -F: '/^Block count/ { c = $2 } /^Block size/ { s = $2 } /^FS Error count/ { e = $2 }
+      /^Filesystem state/ && /error/ { e = e + 0 > 0 ? e : 1 }
+      END { printf "%.0f %.0f %.0f\n", c, s, e }')
+  ((ERRS == 0)) || finding "ext4 on $SOURCE has recorded errors (tune2fs -l: state or FS Error count): storage fault (SOLUTION.md catalogue row 16)."
   DEVSIZE=$(blockdev --getsize64 "$SOURCE" 2>/dev/null || echo 0)
   FSBYTES=$((BCOUNT * BSIZE))
   printf 'ext4 spans %s of a %s block device\n' "$(h "$FSBYTES")" "$(h "$DEVSIZE")"
@@ -99,7 +136,7 @@ if [[ $FSTYPE == ext4 && -b $SOURCE ]] && have tune2fs; then
     finding "Filesystem is $(h $((DEVSIZE - FSBYTES))) smaller than $SOURCE: grow it online with resize2fs $SOURCE."
   fi
 fi
-if [[ $(lsblk -dn -o TYPE "$SOURCE" 2>/dev/null) == lvm ]] && have lvs; then
+if [[ $(lsblk -dn -o TYPE "$SOURCE" 2>/dev/null) == lvm ]] && have lvs && need_root "LVM layout"; then
   VG=$(lvs --noheadings -o vg_name "$SOURCE" 2>/dev/null | tr -d ' ' || true)
   probe vgs -o vg_name,vg_size,vg_free "$VG"
   probe pvs -o pv_name,vg_name,pv_size,dev_size
@@ -112,7 +149,7 @@ if [[ $(lsblk -dn -o TYPE "$SOURCE" 2>/dev/null) == lvm ]] && have lvs; then
   if ((${VFREE:-0} > GiB)); then
     finding "VG $VG has $(h "$VFREE") unallocated (Ubuntu's guided LVM install gives the root LV only half of a 20-200 GiB disk): lvextend -r -L +<size> $SOURCE, online."
   fi
-elif [[ $(lsblk -dn -o TYPE "$SOURCE" 2>/dev/null) == part ]] && have growpart; then
+elif [[ $(lsblk -dn -o TYPE "$SOURCE" 2>/dev/null) == part ]] && have growpart && need_root "growpart dry run"; then
   PART=$(basename "$(readlink -f "$SOURCE")")
   DISK=$(lsblk -dn -o PKNAME "$SOURCE")
   PARTNUM=$(cat "/sys/class/block/$PART/partition")
@@ -174,7 +211,7 @@ else
   echo "none"
 fi
 if ((DELETED_BYTES > GiB)); then
-  finding "$(h "$DELETED_BYTES") held by deleted-but-open files. NGINX logs: kill -USR1 <master pid>. Any other holder: follow SOLUTION.md section 1.3 step 3 (never truncate a queue, WAL or mapped file). NGINX request buffers free themselves when the request ends."
+  finding "$(h "$DELETED_BYTES") held by deleted-but-open files. NGINX logs: copy the tail if time allows, then kill -USR1 <master pid>. Any other holder: follow SOLUTION.md section 1.3 step 3 (never truncate a queue, WAL or mapped file). NGINX request buffers free themselves when the request ends."
 fi
 
 section "Large files (>= ${LARGE_MB} MiB) and large files written in the last 60 min"
@@ -202,7 +239,7 @@ NGINX_T=""
 NGINX_S=""
 if [[ -z $MPID ]]; then
   echo "no nginx process"
-else
+elif need_root "NGINX config, open files and error logs"; then
   NGINX_BIN=$(readlink -f "/proc/$MPID/exe")
   printf 'master pid %s, workers %s, binary %s\n' "$MPID" "$(pgrep -c -P "$MPID" || true)" "$NGINX_BIN"
   probe "$NGINX_BIN" -v
@@ -251,7 +288,7 @@ else
     sz=$(stat -L -c %s -- "$fd" 2>/dev/null || echo 0)
     printf '%s\t%s\n' "$sz" "$tgt" | hum
     case $tgt in
-      *' (deleted)') finding "NGINX holds deleted file $tgt ($(h "$sz")): rotation removed it without a reopen. Fix now: kill -USR1 $MPID." ;;
+      *' (deleted)') finding "NGINX holds deleted file $tgt ($(h "$sz")): rotation removed it without a reopen. Copy its tail first if time allows (SOLUTION.md section 1.3, evidence first), then kill -USR1 $MPID." ;;
       *.log.[0-9]* | *.log-[0-9]*) finding "NGINX is still writing to rotated file $tgt: postrotate never reached the master. Fix now: kill -USR1 $MPID." ;;
     esac
   done < <(find "/proc/$MPID/fd" -mindepth 1 -maxdepth 1 -type l -print0 2>/dev/null || true)
@@ -274,7 +311,7 @@ fi
 probe journalctl -u logrotate.service -n 10 --no-pager -o short-iso
 echo "-- state for NGINX logs (/var/lib/logrotate/status)"
 grep -F nginx /var/lib/logrotate/status 2>/dev/null || echo "  none"
-if have logrotate; then
+if have logrotate && need_root "logrotate dry run and log coverage"; then
   # -d: dry run; changes nothing, state file untouched.
   LR=$(logrotate -d /etc/logrotate.conf 2>&1 || true)
   echo "-- logrotate -d errors"
@@ -376,4 +413,9 @@ if ((${#FINDINGS[@]} > 0)); then
   printf ' - %s\n' "${FINDINGS[@]}"
 else
   echo " - no automated check fired; work through the du and find sections above"
+fi
+if ((${#SKIPPED[@]} > 0)); then
+  section "Skipped (needs root): re-run with sudo for a complete report"
+  printf ' - %s\n' "${SKIPPED[@]}"
+  exit 3
 fi

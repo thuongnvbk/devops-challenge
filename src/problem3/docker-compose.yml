@@ -15,17 +15,19 @@ services:
     environment:
       DB_HOST: postgres
       DB_PORT: "5432"
-      DB_USER: postgres
-      DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      # Least-privilege role from postgres/initdb, not the superuser.
+      DB_USER: app
+      DB_PASSWORD: ${APP_DB_PASSWORD:-app-local-dev}
       DB_NAME: postgres
       REDIS_HOST: redis
     depends_on:
       postgres:
         condition: service_healthy
+      # Redis only holds telemetry: the api serves without it.
       redis:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
-      # Readiness (Postgres query + Redis write); its worst case is ~3s.
+      # Readiness gates on Postgres; Redis is reported, not gated. Worst case ~3s.
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/ready"]
       interval: 5s
       timeout: 5s
@@ -37,6 +39,11 @@ services:
     image: postgres:15
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      APP_DB_USER: app
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-app-local-dev}
+    volumes:
+      # Runs on first boot only (empty data directory); see SOLUTION.md.
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # Over TCP on purpose: during first-boot init the entrypoint runs a
       # temporary server on the Unix socket only, so a socket check passes

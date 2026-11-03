@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CI gate (~30s): end to end through nginx, plus recovery from the events behind
+# CI gate (~30s): end to end through nginx, plus behaviour under the events behind
 # the original outages. Runs in its own throwaway Compose project on an
 # ephemeral host port and removes only what it created.
 #   ./smoke-test.sh        optional: TEST_PROJECT=<new name> HOST_PORT=<port>
@@ -54,8 +54,13 @@ expect_ok "recovers after postgres restart"
 # The restart policy would hide a crash; the api must survive, not be restarted.
 [ "$(docker inspect -f '{{.RestartCount}}' "$api")" = 0 ] || fail "api process crashed on postgres restart"
 
-dc restart redis
-expect_ok "recovers after redis restart"
+# Redis only holds telemetry: with it down the api keeps serving and reports degraded.
+dc stop redis
+expect_ok "serves /api/users with redis down"
+[[ $(dc exec -T nginx curl -s -m 5 http://api:3000/ready) == *'"redis":"degraded"'* ]] ||
+  fail "/ready does not report redis as degraded"
+dc start redis
+expect_ok "still serving after redis returns"
 
 # Recreate the api on a new IP. Holding the freed address stops Docker from
 # reusing it, which would hide a proxy that cached the old one.

@@ -9,32 +9,35 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 LAT_BUDGET=8   # s: every failure must be answered inside nginx's 10s read timeout
+DEG_BUDGET=1   # s: a Redis outage may not slow /api/users (Redis is off its path)
 STREAK=10      # good responses in a row that count as recovered
 GRACE_MS=5000  # requests caught by the fault may complete this long after its removal
 failed=0
 judge() { if [ "$1" = ok ]; then v=PASS; else v="FAIL ($1)"; failed=1; fi; }
 
-# evaluate <samples> <fault start ms> <fault removed ms> <dep|blip|disrupt>
+# evaluate <samples> <fault start ms> <fault removed ms> <dep|blip|degrade|disrupt>
 # One sample per request: <start_ms> <end_ms> <http_code> <seconds> <body_ok>,
-# processed in completion order. dep rows (dependency outage) must show app
-# 500s completing inside [start, removed + grace], and no other failure: a 502,
-# 504, transport error or bad body means the app did not answer. blip rows (a
+# processed in completion order. dep rows (Postgres outage) must show app 500s
+# completing inside [start, removed + grace], and no other failure: a 502, 504,
+# transport error or bad body means the app did not answer. blip rows (a
 # restart short enough to be absorbed without errors) have the same rule minus
-# the 500s; row() confirms the fault from the app log instead. disrupt rows
-# (api crash or recreate) may fail any way. Recovery needs STREAK good responses
+# the 500s; row() confirms the fault from the app log instead. degrade rows
+# (Redis outage) must not fail or slow any request (DEG_BUDGET); row() proves
+# the fault from the app log. disrupt rows (api crash or recreate) may fail any way. Recovery needs STREAK good responses
 # (200 and "ok":true) completing after the removal and after the last failure;
 # "recovered" is when the first of them completed, relative to the removal.
 evaluate() {
   sort -n -k2 "$1" | awk -v fs="$2" -v tr="$3" -v grace="$GRACE_MS" -v kind="$4" \
-    -v budget="$LAT_BUDGET" -v need="$STREAK" '
+    -v budget="$LAT_BUDGET" -v deg="$DEG_BUDGET" -v need="$STREAK" '
     function add(m) { why = (why == "") ? m : why "; " m }
     { n++; if ($4 > max) max = $4
       if ($3 == 200 && $5 == 1) { ok++; if ($2 > tr) { if (!post) first = $2; post++ } }
       else { post = 0; if ($3 == 500) { e5++; if ($2 >= fs && $2 <= tr + grace) seen++ } else other++ } }
     END {
       if (kind == "dep" && !seen) add("fault not observed")
-      if (kind != "disrupt" && other) add(other " non-app failures")
-      if (max > budget) add("latency " max "s")
+      if (kind == "degrade" && e5 + other) add(e5 + other " failed requests")
+      else if (kind != "disrupt" && other) add(other " non-app failures")
+      if (max > (kind == "degrade" ? deg : budget)) add("latency " max "s")
       if (post < need) add("no sustained recovery")
       printf "%d %d %d %d %.2f %s %s\n", n, ok, e5, other, max,
         (post >= need) ? sprintf("%.1f", (first - tr) / 1000) : "-", (why == "") ? "ok" : why }'
@@ -42,7 +45,7 @@ evaluate() {
 
 # backlog_eval <monitor capture> <pause ms> <unpause ms> <monitor_seen 0|1> <load exit code>
 # Counts SET last_call that Redis ran after the hang ended and >1.5s after their
-# request (already failed by the 1s command timeout). Refuses to report a number
+# request (the 1s command timeout had already given up on them). Refuses to report a number
 # unless the evidence is real: MONITOR was capturing, the load generator
 # succeeded, and the capture holds baseline writes from before the hang.
 backlog_eval() {
@@ -78,6 +81,9 @@ if [ "${1:-}" = --self-test ]; then
   check "restart absorbed without errors" PASS blip < <(goods 11 22)
   check "502 during a dependency restart" FAIL blip < <(echo "900 905 502 0.005 0"; goods 11 22)
   check "502 during an api recreate" PASS disrupt < <(echo "900 905 502 0.005 0"; goods 11 22)
+  check "redis outage served with 200s" PASS degrade < <(goods 4 22)
+  check "500 during a redis outage" FAIL degrade < <(echo "900 1000 500 0.1 0"; goods 11 22)
+  check "1.5s 200s during a redis outage" FAIL degrade < <(echo "900 2400 200 1.5 1"; goods 11 22)
   bcheck() { # bcheck <name> <want PASS|FAIL> <monitor_seen> <load rc>; capture on stdin
     cat >"$t"
     read -r late base why <<<"$(backlog_eval "$t" 2000000 3000000 "$3" "$4")"
@@ -147,9 +153,9 @@ probe_start() {
 }
 probe_stop() { rm -f "$work/run"; wait; }
 
-# row <name> <dep|blip|disrupt> <expected api restarts|any> <fault cmd> <hold s> [<recover cmd>] [<api log line that proves the fault>]
+# row <name> <dep|blip|degrade|disrupt> <expected api restarts|any> <fault cmd> <hold s> [<recover cmd>] [<api log line that proves the fault>]
 row() {
-  local name=$1 kind=$2 want=$3 fault=$4 hold=$5 recover=${6:-} proof=${7:-} r0 t_start t_rec restarts since
+  local name=$1 kind=$2 want=$3 fault=$4 hold=$5 recover=${6:-} proof=${7:-} r0 t_start t_rec restarts since logs
   r0=$(docker inspect -f '{{.RestartCount}}' "$(svc api)")
   probe_start
   sleep 3
@@ -163,7 +169,9 @@ row() {
   probe_stop
   read -r n ok e5 other max rec why <<<"$(evaluate "$work/p" "$t_start" "$t_rec" "$kind")"
   restarts=$(($(docker inspect -f '{{.RestartCount}}' "$(svc api)") - r0))
-  if [ -n "$proof" ] && ! docker logs --since "$since" "$(svc api)" 2>&1 | grep -qF "$proof"; then
+  # Capture first: under pipefail, grep -q exiting early would SIGPIPE docker logs.
+  logs=$(docker logs --since "$since" "$(svc api)" 2>&1)
+  if [ -n "$proof" ] && ! grep -qF "$proof" <<<"$logs"; then
     why=$([ "$why" = ok ] && echo "fault not observed in api log" || echo "$why; fault not observed in api log")
   fi
   if [ "$want" != any ] && [ "$restarts" != "$want" ]; then
@@ -194,10 +202,11 @@ printf '%-26s %5s %5s %5s %5s %8s %8s  %s\n' fault reqs good 500 other max recov
 row "postgres restart" blip 0 "dc restart postgres" 0 "" '"dep":"postgres","source":"idle_client"'
 row "postgres down 10s" dep 0 "dc stop postgres" 10 "dc start postgres"
 row "postgres hung 10s" dep 0 "docker pause $pg" 10 "docker unpause $pg"
-row "redis down 10s" dep 0 "dc stop redis" 10 "dc start redis"
-row "redis hung 30s" dep 0 "docker pause $rd" 30 "docker unpause $rd"
-row "redis rejects writes 10s" dep 0 "docker exec $rd redis-cli config set maxmemory 1" 10 \
-  "docker exec $rd redis-cli config set maxmemory 0"
+redis_proof='"dep":"redis","source":"last_call_write"'
+row "redis down 10s" degrade 0 "dc stop redis" 10 "dc start redis" "$redis_proof"
+row "redis hung 30s" degrade 0 "docker pause $rd" 30 "docker unpause $rd" "$redis_proof"
+row "redis rejects writes 10s" degrade 0 "docker exec $rd redis-cli config set maxmemory 1" 10 \
+  "docker exec $rd redis-cli config set maxmemory 0" "$redis_proof"
 row "api crash (SIGKILL)" disrupt 1 crash_api 0
 old_ip=$(ip_of api)
 row "api recreate on new IP" disrupt any recreate_api_new_ip 0
@@ -209,9 +218,9 @@ echo "  api IP $old_ip -> $new_ip  $v"
 wait_healthy
 
 echo
-# Writes Redis still runs after a hang ends, >1.5s after their request (whose 1s
-# command timeout had already failed it), at a fixed offered 100 req/s. Must not
-# grow with the hang's length: timed-out commands may not pile up or replay.
+# Writes Redis still runs after a hang ends, >1.5s after their request (the 1s
+# command timeout had already given up on them), at a fixed offered 100 req/s.
+# Must not grow with the hang's length: timed-out commands may not pile up or replay.
 loadjs='const [rate, secs] = process.argv.slice(2).map(Number);
 const t = setInterval(() => fetch("http://127.0.0.1:3000/api/users").then((r) => r.arrayBuffer()).catch(() => {}), 1000 / rate);
 setTimeout(() => { clearInterval(t); setTimeout(() => process.exit(0), 1500); }, secs * 1000);'
@@ -252,27 +261,29 @@ printf '%-40s %s\n' "late Redis writes after a hang" \
   "10s hang: $short (baseline $sbase), 30s hang: $long (baseline $lbase)  $v"
 wait_healthy
 
-# Readiness must fail inside the 5s healthcheck timeout when a dependency
-# cannot serve, and log the fail and the recovery (readiness_changed).
-for f in "pause $pg|unpause $pg|postgres|postgres hung" \
-  "exec $rd redis-cli config set maxmemory 1|exec $rd redis-cli config set maxmemory 0|redis|redis rejects writes"; do
-  IFS='|' read -r on off dep name <<<"$f"
+# Readiness answers inside the 5s healthcheck timeout: 503 when Postgres
+# cannot serve, 200 with "redis":"degraded" when only Redis fails. Both log
+# the bad state and the recovery (readiness_changed).
+for f in "pause $pg|unpause $pg|postgres|postgres hung|503|\"status\":\"unavailable\"|fail" \
+  "exec $rd redis-cli config set maxmemory 1|exec $rd redis-cli config set maxmemory 0|redis|redis rejects writes|200|\"redis\":\"degraded\"|degraded"; do
+  IFS='|' read -r on off dep name want body bad <<<"$f"
   since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
   eval "docker $on" >/dev/null
-  r=$(docker exec "$(svc nginx)" curl -s -o /dev/null -m 10 -w '%{http_code} %{time_total}' http://api:3000/ready || true)
+  r=$(docker exec "$(svc nginx)" curl -s -m 10 -w '\n%{http_code} %{time_total}' http://api:3000/ready || true)
   eval "docker $off" >/dev/null
-  for _ in $(seq 15); do
-    [ "$(docker exec "$(svc nginx)" curl -s -o /dev/null -m 5 -w '%{http_code}' http://api:3000/ready || true)" != 200 ] || break
+  for _ in $(seq 15); do # until fully ready again (Redis degradation also returns 200)
+    [[ $(docker exec "$(svc nginx)" curl -s -m 5 http://api:3000/ready || true) != *'"status":"ok"'* ]] || break
     sleep 1
   done
   logs=$(docker logs --since "$since" "$(svc api)" 2>&1)
-  code=${r% *} t=${r#* } why=ok
-  [ "$code" = 503 ] && awk -v t="$t" 'BEGIN { exit !(t < 5) }' || why="got $code in ${t}s"
-  for s in fail ok; do
+  last=${r##*$'\n'} code=${last% *} t=${last#* } why=ok
+  [ "$code" = "$want" ] && [[ ${r%$'\n'*} == *"$body"* ]] && awk -v t="$t" 'BEGIN { exit !(t < 5) }' ||
+    why="got $code in ${t}s"
+  for s in "$bad" ok; do
     grep -q "\"event\":\"readiness_changed\",\"dep\":\"$dep\",\"state\":\"$s\"" <<<"$logs" || why="no $s transition logged"
   done
   judge "$why"
-  printf '%-40s %s\n' "/ready, $name" "$code in ${t}s, fail and recovery logged  $v"
+  printf '%-40s %s\n' "/ready, $name" "$code in ${t}s, $bad and recovery logged  $v"
 done
 wait_healthy
 
@@ -280,13 +291,13 @@ wait_healthy
 # requests must succeed at once (a leaking pool hangs here instead).
 docker exec -i "$pg" psql -U postgres -v ON_ERROR_STOP=1 -q >/dev/null <<'SQL'
 CREATE FUNCTION public.now() RETURNS timestamptz LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected'; END $$;
-ALTER ROLE postgres SET search_path = public, pg_catalog;
+ALTER ROLE app SET search_path = public, pg_catalog;
 SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'api';
 SQL
 errs=$(for _ in $(seq 15); do curl -s -o /dev/null -m 5 -w '%{http_code}\n' "$url" || true; done | grep -c '^500$' || true)
 docker exec -i "$pg" psql -U postgres -v ON_ERROR_STOP=1 -q >/dev/null <<'SQL'
 DROP FUNCTION public.now();
-ALTER ROLE postgres RESET search_path;
+ALTER ROLE app RESET search_path;
 SQL
 oks=$(for _ in $(seq 10); do curl -s -m 5 "$url" || true; echo; done | grep -c '"ok":true' || true)
 why=ok

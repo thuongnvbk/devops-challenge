@@ -1,0 +1,126 @@
+name: frontend-deploy
+
+# Deploys one already-built, already-attested SPA bundle to one environment.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment (frontend-staging | frontend-production)
+        type: string
+        required: true
+      artifact:
+        description: Name of the workflow artifact produced by frontend.yml
+        type: string
+        required: true
+      sha256:
+        description: Digest of site.tar.gz recorded at build time
+        type: string
+        required: true
+    outputs:
+      deployed:
+        description: "'true' if the environment now serves this release"
+        value: ${{ jobs.deploy.outputs.deployed }}
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: deploy (${{ inputs.environment }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.SITE_URL }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+    outputs:
+      deployed: ${{ steps.release.outcome == 'success' }}
+    env:
+      RELEASE: ${{ github.sha }}
+      DEPLOY_ENV: ${{ inputs.environment }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SITE_BUCKET: ${{ vars.SITE_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.DISTRIBUTION_ID }}
+      SITE_URL: ${{ vars.SITE_URL }}
+      SIGNER_WORKFLOW: .github/workflows/frontend.yml
+    steps:
+      - name: Check configuration
+        env:
+          SHA256: ${{ inputs.sha256 }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::sha256 input is not a digest"; exit 1; }
+          for v in AWS_ROLE_ARN AWS_REGION SITE_BUCKET DISTRIBUTION_ID SITE_URL; do
+            [[ -n "${!v}" ]] || { echo "::error::variable $v is not set on environment $DEPLOY_ENV"; exit 1; }
+          done
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}/dist
+
+      - name: Verify digest and provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA256: ${{ inputs.sha256 }}
+          ARTIFACT: ${{ runner.temp }}/dist/site.tar.gz
+        run: ci/verify-artifact.sh "$ARTIFACT" "$SHA256" "$SIGNER_WORKFLOW"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: frontend-${{ github.run_id }}-${{ github.run_attempt }}
+          role-duration-seconds: 1800
+
+      - name: Forward-only guard
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deployed="$(frontend/deploy/current.sh)"
+          decision="$(ci/forward-only.sh "$deployed" "$RELEASE")"
+          echo "previous=$deployed" >>"$GITHUB_OUTPUT"
+          echo "decision=$decision" >>"$GITHUB_OUTPUT"
+
+      # publish.sh records the release create-once (artifact by digest, then
+      # commit -> digest), activate.sh re-verifies and switches it live, and
+      # release.sh restores and re-verifies the previous release if anything
+      # fails. Exit 1: not kept, previous live. Exit 2: needs a human.
+      - name: Release (publish, activate, smoke test, restore on failure)
+        id: release
+        if: steps.guard.outputs.decision == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ runner.temp }}/dist/site.tar.gz
+        run: frontend/deploy/release.sh deploy "$ARTIFACT" "$RELEASE"
+
+      - name: Summary
+        if: always()
+        env:
+          PREVIOUS: ${{ steps.guard.outputs.previous }}
+          DECISION: ${{ steps.guard.outputs.decision }}
+          OUTCOME: ${{ steps.release.outcome }}
+        run: |
+          {
+            echo "### frontend -> ${DEPLOY_ENV}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| release | \`${RELEASE}\` |"
+            echo "| previously deployed | \`${PREVIOUS:-none}\` |"
+            echo "| decision | ${DECISION:-not reached} |"
+            echo "| outcome | ${OUTCOME:-skipped} |"
+            if [[ -n "$PREVIOUS" ]]; then
+              echo
+              echo "Manual rollback: run **frontend-rollback** with environment \`${DEPLOY_ENV}\` and release \`${PREVIOUS}\`."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"

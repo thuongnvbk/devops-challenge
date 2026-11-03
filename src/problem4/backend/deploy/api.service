@@ -1,0 +1,33 @@
+[Unit]
+Description=Backend HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/opt/api/current/api
+Environment=API_ADDR=:8080
+Restart=on-failure
+RestartSec=2
+# The ALB has already drained the instance by the time SIGTERM arrives; the
+# process gets 20s to finish in-flight requests (see main.go).
+TimeoutStopSec=30
+
+# Sandbox: no persistent user, no writable filesystem, no privilege gain.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

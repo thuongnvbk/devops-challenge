@@ -1,0 +1,65 @@
+name: frontend-rollback
+run-name: frontend rollback ${{ inputs.environment }} to ${{ inputs.release }}
+
+# Manual rollback: re-activate a release previously published to this
+# environment. activate.sh re-verifies the archived artifact's digest and
+# provenance before anything changes; release.sh puts back what was live if
+# the target fails its smoke test, exactly as a failed deploy is undone.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to roll back
+        type: choice
+        options: [frontend-staging, frontend-production]
+        required: true
+      release:
+        description: Full commit SHA to restore (shown in each deploy's job summary)
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  rollback:
+    name: rollback (${{ inputs.environment }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.SITE_URL }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+    env:
+      TARGET: ${{ inputs.release }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SITE_BUCKET: ${{ vars.SITE_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.DISTRIBUTION_ID }}
+      SITE_URL: ${{ vars.SITE_URL }}
+      SIGNER_WORKFLOW: .github/workflows/frontend.yml
+    steps:
+      - name: Validate input
+        run: |
+          [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]] ||
+            { echo "::error::release must be a full 40-character lowercase commit SHA"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: frontend-rollback-${{ github.run_id }}-${{ github.run_attempt }}
+          role-duration-seconds: 1800
+
+      - name: Roll back (verify, activate, smoke test, restore on failure)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: frontend/deploy/release.sh rollback "$TARGET"

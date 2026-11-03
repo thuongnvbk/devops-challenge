@@ -1,0 +1,11 @@
+aws_region                 = "eu-west-1"
+github_repository          = "example-org/web-product"
+github_owner_id            = 123456
+github_repository_id       = 789012
+stage                      = "production"
+release_bucket_name        = "example-production-releases"
+asg_name                   = "api-production"
+launch_template_id         = "lt-0fedcba9876543210"
+instance_role_arn          = "arn:aws:iam::222222222222:role/api-production-instance"
+site_bucket_name           = "example-production-site"
+cloudfront_distribution_id = "E2EXAMPLEPROD"

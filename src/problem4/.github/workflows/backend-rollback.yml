@@ -1,0 +1,81 @@
+name: backend-rollback
+run-name: backend rollback ${{ inputs.environment }} to ${{ inputs.release }}
+
+# Manual rollback: move the fleet back onto the launch template version of a
+# release that was previously published to this environment. That version
+# pins the old artifact by digest *and* the AMI/instance settings it ran
+# with, so this restores the previous machine, not just the previous binary.
+# Runs in recovery mode: no alarm gate, because an incident's alarms are
+# usually firing and AWS would refuse to start, and no auto rollback, which
+# would return to the broken release. Health checks, the timeout and the
+# smoke test still decide. A refresh still active (e.g. a recovery that timed
+# out) is cancelled first, never rolled back, then replaced by this one.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to roll back
+        type: choice
+        options: [backend-staging, backend-production]
+        required: true
+      release:
+        description: Full commit SHA to restore (shown in each deploy's job summary)
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  rollback:
+    name: rollback (${{ inputs.environment }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.API_BASE_URL }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TARGET: ${{ inputs.release }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ASG_NAME: ${{ vars.ASG_NAME }}
+      LAUNCH_TEMPLATE_ID: ${{ vars.LAUNCH_TEMPLATE_ID }}
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+    steps:
+      - name: Validate input
+        run: |
+          [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]] ||
+            { echo "::error::release must be a full 40-character lowercase commit SHA"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: backend-rollback-${{ github.run_id }}-${{ github.run_attempt }}
+          role-duration-seconds: 3600
+
+      - name: Find the release's launch template version
+        id: find
+        run: |
+          version="$(backend/deploy/rollout.sh find "$TARGET")"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Roll back (recovery refresh, smoke test)
+        env:
+          VERSION: ${{ steps.find.outputs.version }}
+          REFRESH_STATE_FILE: ${{ runner.temp }}/refresh-state
+        run: backend/deploy/rollout.sh refresh --recovery "$VERSION"
+
+      - name: Handle cancellation mid-refresh
+        if: cancelled() && steps.find.outputs.version != ''
+        env:
+          REFRESH_STATE_FILE: ${{ runner.temp }}/refresh-state
+        run: backend/deploy/rollout.sh on-cancel

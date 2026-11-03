@@ -1,0 +1,38 @@
+github_owner                 = "example-org"
+repository                   = "web-product"
+production_reviewer_team_ids = [1234567]
+
+environment_variables = {
+  backend-staging = {
+    AWS_ROLE_ARN         = "arn:aws:iam::111111111111:role/github-backend-deploy-staging"
+    AWS_REGION           = "eu-west-1"
+    RELEASE_BUCKET       = "example-staging-releases"
+    ASG_NAME             = "api-staging"
+    LAUNCH_TEMPLATE_ID   = "lt-0123456789abcdef0"
+    API_BASE_URL         = "https://api.staging.example.com"
+    ROLLBACK_ALARM_NAMES = "api-staging-target-5xx,api-staging-unhealthy-hosts"
+  }
+  backend-production = {
+    AWS_ROLE_ARN         = "arn:aws:iam::222222222222:role/github-backend-deploy-production"
+    AWS_REGION           = "eu-west-1"
+    RELEASE_BUCKET       = "example-production-releases"
+    ASG_NAME             = "api-production"
+    LAUNCH_TEMPLATE_ID   = "lt-0fedcba9876543210"
+    API_BASE_URL         = "https://api.example.com"
+    ROLLBACK_ALARM_NAMES = "api-production-target-5xx,api-production-unhealthy-hosts"
+  }
+  frontend-staging = {
+    AWS_ROLE_ARN    = "arn:aws:iam::111111111111:role/github-frontend-deploy-staging"
+    AWS_REGION      = "eu-west-1"
+    SITE_BUCKET     = "example-staging-site"
+    DISTRIBUTION_ID = "E1EXAMPLESTAGING"
+    SITE_URL        = "https://staging.example.com"
+  }
+  frontend-production = {
+    AWS_ROLE_ARN    = "arn:aws:iam::222222222222:role/github-frontend-deploy-production"
+    AWS_REGION      = "eu-west-1"
+    SITE_BUCKET     = "example-production-site"
+    DISTRIBUTION_ID = "E2EXAMPLEPROD"
+    SITE_URL        = "https://www.example.com"
+  }
+}

@@ -1,0 +1,175 @@
+name: backend
+
+# PRs: lint, test, scan, build (proves the change is releasable).
+# main: the same, then attest the artifact and promote that exact artifact
+# staging -> production. Production waits for approval on its environment.
+on:
+  pull_request:
+    paths:
+      - backend/**
+      - ci/**
+      - .github/workflows/backend*.yml
+  push:
+    branches: [main]
+    paths:
+      - backend/**
+      - ci/**
+      - .github/workflows/backend*.yml
+  workflow_dispatch: {}
+
+permissions: {}
+
+# Superseded PR runs are cancelled. Runs on main are never cancelled (that
+# could interrupt a deploy); per-environment deploy concurrency lives in
+# backend-deploy.yml.
+concurrency:
+  group: backend-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: lint, test, scan, build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # Use exactly the toolchain setup-go installed from go.mod. Without this,
+      # `go run tool@version` re-selects a toolchain from the tool's own go.mod
+      # (possibly older than ours) and then cannot load this module.
+      GOTOOLCHAIN: local
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          cache: false # stdlib only; nothing to cache
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::files need gofmt: $unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+
+      - name: Rollout and rollback logic tests
+        run: ./deploy/rollout_test.sh
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      # Release outputs live in .release/ at the workspace root: one common
+      # root keeps the uploaded artifact flat, and workspace-relative paths
+      # mean the same thing to every step and action.
+      - name: Package
+        id: package
+        env:
+          RELEASE: ${{ github.sha }}
+        run: |
+          out="$GITHUB_WORKSPACE/.release"
+          ./deploy/package.sh "$RELEASE" "$out"
+          echo "sha256=$(cut -d' ' -f1 "$out/api.tar.gz.sha256")" >>"$GITHUB_OUTPUT"
+          mkdir -p "$out/sbom-root"
+          tar -xzf "$out/api.tar.gz" -C "$out/sbom-root"
+
+      # Syft reads the Go build info embedded in the binary that ships.
+      - name: SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .release/sbom-root
+          format: spdx-json
+          output-file: .release/api.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backend-${{ github.sha }}
+          path: |
+            .release/api.tar.gz
+            .release/api.spdx.json
+          if-no-files-found: error
+          retention-days: 30
+          # A re-run of this job rebuilds byte-identical output; allow it to
+          # replace the previous attempt's upload instead of failing.
+          overwrite: true
+
+  # The only job holding id-token: write for signing. It runs no repository
+  # code, only pinned actions, so a compromised build step cannot sign.
+  attest:
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: backend-${{ github.sha }}
+          path: dist
+
+      - name: Verify digest matches the build
+        env:
+          SHA256: ${{ needs.ci.outputs.sha256 }}
+        run: echo "${SHA256}  dist/api.tar.gz" | sha256sum --check --strict
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/api.tar.gz
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/api.tar.gz
+          sbom-path: dist/api.spdx.json
+
+  staging:
+    needs: [ci, attest]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+    uses: ./.github/workflows/backend-deploy.yml
+    with:
+      environment: backend-staging
+      artifact: backend-${{ github.sha }}
+      sha256: ${{ needs.ci.outputs.sha256 }}
+
+  # Same artifact, same digest. Skipped when staging skipped this release
+  # (a newer one was already there), so production never runs something that
+  # staging did not.
+  production:
+    needs: [ci, staging]
+    if: needs.staging.outputs.deployed == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+    uses: ./.github/workflows/backend-deploy.yml
+    with:
+      environment: backend-production
+      artifact: backend-${{ github.sha }}
+      sha256: ${{ needs.ci.outputs.sha256 }}

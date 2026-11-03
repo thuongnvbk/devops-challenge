@@ -1,0 +1,11 @@
+aws_region                 = "eu-west-1"
+github_repository          = "example-org/web-product"
+github_owner_id            = 123456
+github_repository_id       = 789012
+stage                      = "staging"
+release_bucket_name        = "example-staging-releases"
+asg_name                   = "api-staging"
+launch_template_id         = "lt-0123456789abcdef0"
+instance_role_arn          = "arn:aws:iam::111111111111:role/api-staging-instance"
+site_bucket_name           = "example-staging-site"
+cloudfront_distribution_id = "E1EXAMPLESTAGING"

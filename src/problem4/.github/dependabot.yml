@@ -1,0 +1,41 @@
+# Keeps SHA-pinned actions, Go/npm dependencies and Terraform providers
+# current. The cooldown skips versions younger than a week, so a freshly
+# published malicious release is usually yanked before it is proposed.
+# Security updates ignore the cooldown.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /backend
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      frontend-tooling:
+        patterns: ["*"]
+
+  - package-ecosystem: terraform
+    directories:
+      - /infra/aws-deploy-roles
+      - /infra/github-environments
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7

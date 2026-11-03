@@ -1,0 +1,241 @@
+name: ci
+
+# Repository-level CI for the challenge submission. It exercises the CI half
+# of every problem on each push and pull request. It has no deploy jobs, no
+# cloud credentials, and a read-only token.
+on:
+  push: {}
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Container images pinned by digest (tag kept for readability).
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+  SHELLCHECK_IMAGE: koalaman/shellcheck:v0.10.0@sha256:2097951f02e735b613f4a34de20c40f937a6c8f18ecb170612c88c34517221fb
+  PROMETHEUS_IMAGE: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+  # Terraform release zip, verified against this checksum before use.
+  TERRAFORM_VERSION: 1.17.1
+  TERRAFORM_SHA256: 4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061
+  # Built from source; the Go checksum database verifies the module.
+  GITLEAKS_MODULE: github.com/zricethezav/gitleaks/v8@v8.30.1
+
+jobs:
+  workflow-lint:
+    name: workflows and scripts (actionlint, zizmor, shellcheck)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint (this repository)
+        run: docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE" -color
+
+      # actionlint resolves `uses: ./.github/workflows/...` from the project
+      # root, and Problem 4's root is src/problem4. Lint a copy that is its
+      # own git project, exactly as that repository would be.
+      - name: actionlint (Problem 4 deliverable workflows)
+        run: |
+          p4="$RUNNER_TEMP/problem4"
+          cp -R src/problem4 "$p4"
+          git -C "$p4" init -q
+          docker run --rm -v "$p4:/repo" -w /repo "$ACTIONLINT_IMAGE" -color
+
+      - name: Install zizmor (hash-pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zizmor"
+          "$RUNNER_TEMP/zizmor/bin/pip" install --quiet --no-deps --require-hashes -r src/problem4/ci/requirements.txt
+
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          z="$RUNNER_TEMP/zizmor/bin/zizmor"
+          "$z" --format github .github/workflows
+          "$z" --config src/problem4/.github/zizmor.yml --format github src/problem4/.github/workflows
+
+      # Globs expand on the runner, so run from the mounted directory to make
+      # the expanded relative paths valid inside the container too.
+      - name: shellcheck (Problem 4 scripts)
+        working-directory: src/problem4
+        run: >-
+          docker run --rm -v "$PWD:/mnt" -w /mnt "$SHELLCHECK_IMAGE"
+          ci/*.sh backend/deploy/*.sh frontend/deploy/*.sh
+
+  secrets:
+    name: secrets (gitleaks, full history)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/problem4/backend/go.mod
+          cache: false
+
+      - name: gitleaks
+        run: go run "$GITLEAKS_MODULE" git --redact --no-banner --verbose .
+
+  problem4-backend:
+    name: problem4 backend (Go, rollout tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: src/problem4/backend
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/problem4/backend/go.mod
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::files need gofmt: $unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: Rollout and rollback logic tests
+        run: ./deploy/rollout_test.sh
+
+  problem4-frontend:
+    name: problem4 frontend (SPA, release tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: src/problem4/frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: src/problem4/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: src/problem4/frontend/package-lock.json
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Verify registry signatures
+        run: npm audit signatures
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Vulnerability scan
+        run: npm audit --audit-level=high
+
+      - name: Build
+        env:
+          VITE_RELEASE: ${{ github.sha }}
+        run: npm run build
+
+      - name: Release path tests
+        run: ./deploy/release_test.sh dist
+
+  problem4-terraform:
+    name: problem4 terraform (fmt, validate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform (checksum-verified)
+        run: |
+          zip="$RUNNER_TEMP/terraform.zip"
+          curl -fsSL --retry 3 -o "$zip" \
+            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          echo "${TERRAFORM_SHA256}  ${zip}" | sha256sum --check --strict
+          unzip -q "$zip" terraform -d "$RUNNER_TEMP/bin"
+
+      - name: fmt and validate (providers checked against the committed lock files)
+        working-directory: src/problem4/infra
+        run: |
+          tf="$RUNNER_TEMP/bin/terraform"
+          "$tf" fmt -check -recursive -diff
+          for module in aws-deploy-roles github-environments; do
+            "$tf" -chdir="$module" init -backend=false -input=false -lockfile=readonly
+            "$tf" -chdir="$module" validate
+          done
+
+  problem2:
+    name: problem2 (shellcheck, promtool)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        working-directory: src/problem2
+        run: docker run --rm -v "$PWD:/mnt" -w /mnt "$SHELLCHECK_IMAGE" scripts/*.sh
+
+      - name: promtool check and test rules
+        run: |
+          promtool() {
+            docker run --rm -v "$PWD/src/problem2/monitoring:/w:ro" -w /w \
+              --entrypoint promtool "$PROMETHEUS_IMAGE" "$@"
+          }
+          promtool check rules disk-alerts.rules.yml
+          promtool test rules disk-alerts.test.yml
+
+  problem3:
+    name: problem3 (compose config, fault matrix, smoke test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compose file is valid
+        run: docker compose -f src/problem3/docker-compose.yml config -q
+
+      - name: Fault matrix self-test
+        run: src/problem3/fault-matrix.sh --self-test
+
+      - name: Smoke test (isolated compose project, ephemeral port)
+        run: src/problem3/smoke-test.sh
